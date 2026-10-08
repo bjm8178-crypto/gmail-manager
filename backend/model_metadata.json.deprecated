@@ -1,0 +1,6 @@
+{
+  "deprecation_notice": "This static file is deprecated as of Phase 4 Task 4.3 (2026-10-06)",
+  "replacement": "Use GET /api/ml/active-model-metadata endpoint for live metadata from ml_models table",
+  "reason": "Static files can become stale. Live database queries ensure accuracy.",
+  "migration": "Frontend should call /api/ml/active-model-metadata instead of reading this fixture"
+}

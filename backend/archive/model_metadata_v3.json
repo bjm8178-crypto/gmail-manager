@@ -1,0 +1,123 @@
+{
+  "model_version": "v3",
+  "model_type": "Random Forest",
+  "training_date": "2026-09-11T20:30:00.646838",
+  "datasets": {
+    "CEAS_08.csv": {
+      "rows": 39154,
+      "phishing": 21842,
+      "legitimate": 17312
+    },
+    "Enron.csv": {
+      "rows": 29763,
+      "phishing": 13972,
+      "legitimate": 15791
+    },
+    "Ling.csv": {
+      "rows": 2859,
+      "phishing": 458,
+      "legitimate": 2401
+    },
+    "meajor_cleaned_preprocessed.csv": {
+      "rows": 108591,
+      "phishing": 47966,
+      "legitimate": 60625
+    },
+    "Nazario.csv": {
+      "rows": 1565,
+      "phishing": 1565,
+      "legitimate": 0
+    },
+    "Nigerian_Fraud.csv": {
+      "rows": 3332,
+      "phishing": 3332,
+      "legitimate": 0
+    },
+    "phishing_email.csv": {
+      "rows": 18092,
+      "phishing": 6970,
+      "legitimate": 11122
+    },
+    "phishing_legit_dataset_KD_10000.csv": {
+      "rows": 10000,
+      "phishing": 6000,
+      "legitimate": 4000
+    },
+    "SpamAssasin.csv": {
+      "rows": 5809,
+      "phishing": 1718,
+      "legitimate": 4091
+    },
+    "fradulent_emails.txt": {
+      "rows": 3978,
+      "phishing": 3978,
+      "legitimate": 0
+    }
+  },
+  "total_training_samples": 202882,
+  "total_samples_after_dedup": 204434,
+  "duplicates_removed": 18709,
+  "class_balance": {
+    "phishing": 99115,
+    "legitimate": 105319,
+    "phishing_percentage": 48.48,
+    "used_class_weight": false
+  },
+  "held_out_source": "Nazario",
+  "held_out_samples": 1552,
+  "features": [
+    "num_urls",
+    "has_ip_url",
+    "num_exclamations",
+    "contains_urgent_words",
+    "body_length",
+    "uppercase_ratio",
+    "writing_style_score",
+    "body (TF-IDF)"
+  ],
+  "performance": {
+    "random_test_split": {
+      "samples": 40577,
+      "accuracy": 0.9475,
+      "precision": 0.9412,
+      "recall": 0.9501,
+      "f1_score": 0.9457,
+      "confusion_matrix": [
+        [
+          19906,
+          1158
+        ],
+        [
+          973,
+          18540
+        ]
+      ]
+    },
+    "held_out_source": {
+      "source": "Nazario",
+      "samples": 1552,
+      "accuracy": 0.7925,
+      "precision": 1.0,
+      "recall": 0.7925,
+      "f1_score": 0.8843,
+      "confusion_matrix": [
+        [
+          0,
+          0
+        ],
+        [
+          322,
+          1230
+        ]
+      ]
+    }
+  },
+  "training_time_seconds": 187.19,
+  "improvements_over_v2": {
+    "note": "V3 adds meajor_cleaned_preprocessed.csv (108K rows) + fradulent_emails.txt (4K rows)",
+    "v2_samples": 96427,
+    "v3_samples": 202882,
+    "v2_held_out_f1": 0.9158,
+    "v3_held_out_f1": 0.8843
+  }
+}

@@ -1,0 +1,64 @@
+# Dependencies
+node_modules/
+backend/venv/
+backend/__pycache__/
+*.pyc
+
+# Environment & secrets
+backend/.env
+backend/.env.test
+.env
+backend/token.json
+backend/tokens/
+*.json.backup
+*.env.backup
+
+# Machine Learning models (large binary files - should be stored separately)
+backend/*.pkl
+backend/scam_classifier*.pkl
+backend/model_metadata*.json
+backend/checkpoints/
+
+# Training and diagnostic scripts (internal use only)
+backend/train_*.py
+backend/benchmark_*.py
+backend/diagnose*.py
+backend/debug_*.py
+backend/test_predict*.py
+backend/verify_*.py
+backend/validate_*.py
+backend/v2_*.py
+backend/v3_*.py
+backend/*_log.txt
+backend/*_output.txt
+backend/*_diagnosis.csv
+backend/show_patch_diff.py
+
+# Database (SQLite)
+backend/*.db
+backend/gmail_manager.db*
+*.db
+*.backup*
+
+# Build output
+frontend/dist/
+dist/
+electron/resources/
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+logs/*.log
+logs/*.log.*
+
+# Coverage reports
+htmlcov/
+.coverage
+*.coverage
+
+# Development artifacts
+.planning/
+.kilo/
+*.backup

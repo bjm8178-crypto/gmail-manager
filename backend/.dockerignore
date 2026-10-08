@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Testing
+tests/
+test_*.py
+*.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Logs
+logs/*.log
+*.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Documentation
+*.md
+!README.md
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Model files (should be loaded from database)
+scam_classifier.pkl
+model_metadata.json*
+
+# Migration backups
+migrations/*.backup
+
+# Requirements (only requirements.txt is needed)
+requirements-frozen.txt

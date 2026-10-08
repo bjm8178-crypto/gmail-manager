@@ -1,0 +1,63 @@
+{
+  "name": "gmail-manager",
+  "version": "1.0.0",
+  "description": "AI-powered Gmail management desktop application",
+  "main": "electron/main.js",
+  "author": "Gmail Manager",
+  "license": "MIT",
+  "scripts": {
+    "electron": "electron .",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:backend": "cd backend && python main.py",
+    "dev": "concurrently \"npm run dev:frontend\" \"npm run dev:backend\"",
+    "start": "electron .",
+    "build:frontend": "cd frontend && npm run build",
+    "build:backend": "cd backend && pyinstaller --onefile --name gmail-manager-backend --distpath ../electron/resources main.py",
+    "build:electron": "npx electron-builder build --win",
+    "build": "npm run build:frontend && npm run build:backend && npm run build:electron",
+    "pack": "npx electron-builder --dir"
+  },
+  "dependencies": {
+    "electron": "^28.2.0"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.gmailmanager.app",
+    "productName": "Gmail Manager",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron/**/*",
+      "frontend/dist/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "electron/resources/",
+        "to": "resources/",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.ico"
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "assets/icon.icns"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerHeaderIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}
