@@ -968,6 +968,19 @@ def _analysis_text(body: str) -> str:
     return " ".join(" ".join(parser.parts).split())
 
 
+def _final_analysis_status(routed_status, url_scan_unavailable, label_id):
+    """Return the analysis status that is stored and shown.
+
+    v2_routing reports success as 'complete'. The stored and displayed
+    vocabulary is 'completed'. Anything not fully successful is 'partial'.
+    """
+    if routed_status == "complete":
+        routed_status = "completed"
+    if routed_status != "completed" or url_scan_unavailable or label_id is None:
+        return "partial"
+    return "completed"
+
+
 async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                        ai_router, classification_prompt: str,
                        user_id: int, user_email: str, service,
@@ -1126,9 +1139,9 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                     if "Suspicious attachment detected" not in indicators:
                         indicators = [*indicators, "Suspicious attachment detected"]
             
-            analysis_status = routed.get("analysis_status", "completed")
-            if analysis_status != "completed" or url_scan_unavailable or label_id is None:
-                analysis_status = "partial"
+            analysis_status = _final_analysis_status(
+                routed.get("analysis_status", "completed"), url_scan_unavailable, label_id
+            )
             decision = routed.get("routing_decision", "unknown")
             v2_score = routed.get("v2_score")
             provider_used = routed.get("provider_used")
