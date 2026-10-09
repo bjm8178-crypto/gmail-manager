@@ -241,6 +241,115 @@ psql $DATABASE_URL -c "SELECT 1;"
 
 ---
 
+## Running the Tests
+
+The test suite validates backend functionality against a PostgreSQL database. **Never run tests against your development or production database** — they create, modify, and delete data.
+
+### Setup Test Database
+
+1. Create a dedicated test database on your local PostgreSQL server:
+
+```bash
+cd backend
+python -c "
+import psycopg2
+from pathlib import Path
+
+# Read DATABASE_URL from .env
+env = Path('.env').read_text()
+for line in env.splitlines():
+    if line.strip().startswith('DATABASE_URL='):
+        url = line.split('=', 1)[1].strip().strip('\"').strip(\"'\")
+        break
+
+# Extract connection params
+parts = url.split('://', 1)[1]
+user_pass, host_db = parts.split('@', 1)
+user, password = user_pass.split(':', 1)
+host_port, _ = host_db.split('/', 1)
+host = host_port.split(':')[0]
+port = host_port.split(':')[1] if ':' in host_port else '5432'
+
+# Connect to postgres database and create test db
+admin_url = f'postgresql://{user}:{password}@{host}:{port}/postgres'
+conn = psycopg2.connect(admin_url)
+conn.autocommit = True
+cur = conn.cursor()
+cur.execute('DROP DATABASE IF EXISTS gmail_manager_test')
+cur.execute('CREATE DATABASE gmail_manager_test')
+cur.close()
+conn.close()
+print('Created gmail_manager_test')
+"
+```
+
+2. Apply the schema to the test database:
+
+```bash
+python -c "
+import psycopg2
+from pathlib import Path
+
+# Read dev DATABASE_URL
+env = Path('.env').read_text()
+for line in env.splitlines():
+    if line.strip().startswith('DATABASE_URL='):
+        url = line.split('=', 1)[1].strip().strip('\"').strip(\"'\")
+        break
+
+# Build test database URL
+parts = url.split('://', 1)[1]
+user_pass, host_db = parts.split('@', 1)
+host_port, _ = host_db.split('/', 1)
+test_url = f'postgresql://{user_pass}@{host_port}/gmail_manager_test'
+
+# Apply schema
+schema = Path('postgres_schema.sql').read_text()
+conn = psycopg2.connect(test_url)
+cur = conn.cursor()
+cur.execute(schema)
+conn.commit()
+cur.close()
+conn.close()
+print('Applied schema to gmail_manager_test')
+"
+```
+
+### Test Configuration
+
+The `pytest.ini` file has been updated to collect tests from both `tests/` and root-level `test_*.py` files:
+
+```ini
+testpaths = .
+norecursedirs = archive scripts htmlcov venv env node_modules .git __pycache__
+```
+
+### Running Tests
+
+Set `DATABASE_URL` to the test database before running pytest:
+
+```bash
+cd backend
+
+# Linux/Mac
+export DATABASE_URL="postgresql://user:password@localhost:5432/gmail_manager_test"
+pytest -q
+
+# Windows (bash/Git Bash)
+DATABASE_URL="postgresql://user:password@localhost:5432/gmail_manager_test" pytest -q
+```
+
+**Expected results (before this branch):** 380 passed, 3 skipped
+
+### Important Notes
+
+- **Never set `DATABASE_URL` to your dev/production database when running tests.** Many tests insert, update, and delete data.
+- Tests that import `main.py` require all required environment variables (`SECRET_KEY`, `DB_ENCRYPTION_KEY`, etc.) even when testing isolated functions.
+- Some tests require AI provider keys to fully validate provider routing logic.
+- Collection errors related to FastAPI version compatibility are known and affect a subset of integration tests.
+
+---
+
 ## Additional Resources
 
 - **ML Model Setup:** [LOCAL_ML_SETUP.md](LOCAL_ML_SETUP.md)
