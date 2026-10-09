@@ -194,17 +194,21 @@ async def scan_url(url: str, email_id: str,
             if response.status_code == 429:
                 logger.info(f"[SECURITY] DIAGNOSIS: Rate limit / quota exceeded (HTTP 429)")
                 exception_type = "RATE_LIMIT"
+                failure_reason = "safe_browsing_rate_limited"
                 exception_message = f"HTTP 429: {response_body}"
             elif response.status_code == 400:
                 logger.info(f"[SECURITY] DIAGNOSIS: Bad request / malformed URL (HTTP 400)")
                 exception_type = "BAD_REQUEST"
+                failure_reason = "safe_browsing_bad_request"
                 exception_message = f"HTTP 400: {response_body}"
             elif response.status_code >= 500:
                 logger.info(f"[SECURITY] DIAGNOSIS: Server error (HTTP {response.status_code})")
                 exception_type = "SERVER_ERROR"
+                failure_reason = "safe_browsing_http_error"
                 exception_message = f"HTTP {response.status_code}: {response_body}"
             else:
                 exception_type = f"HTTP_{response.status_code}"
+                failure_reason = "safe_browsing_http_error"
                 exception_message = response_body
             
             scan_failed = True
@@ -221,6 +225,7 @@ async def scan_url(url: str, email_id: str,
     except asyncio.TimeoutError as e:
         import traceback
         exception_type = "TIMEOUT"
+        failure_reason = "safe_browsing_timeout"
         exception_message = f"Timeout after {URL_CHECK_TIMEOUT_SECONDS}s"
         logger.info(f"[SECURITY] DIAGNOSIS: Timeout checking URL {url[:60]}")
         logger.info(f"[SECURITY] Timeout value: {URL_CHECK_TIMEOUT_SECONDS}s")
@@ -229,6 +234,7 @@ async def scan_url(url: str, email_id: str,
     except httpx.TimeoutException as e:
         import traceback
         exception_type = "TIMEOUT"
+        failure_reason = "safe_browsing_timeout"
         exception_message = f"httpx.TimeoutException: {str(e)}"
         logger.info(f"[SECURITY] DIAGNOSIS: httpx Timeout checking URL {url[:60]}")
         logger.info(f"[SECURITY] Timeout value: {URL_CHECK_TIMEOUT_SECONDS}s")
@@ -238,6 +244,7 @@ async def scan_url(url: str, email_id: str,
     except httpx.HTTPStatusError as e:
         import traceback
         exception_type = "HTTP_ERROR"
+        failure_reason = "safe_browsing_http_error"
         exception_message = f"HTTPStatusError: {e.response.status_code}"
         response_status = e.response.status_code
         logger.info(f"[SECURITY] DIAGNOSIS: HTTP status error for {url[:60]}: {e.response.status_code}")
@@ -246,6 +253,7 @@ async def scan_url(url: str, email_id: str,
     except Exception as e:
         import traceback
         exception_type = type(e).__name__
+        failure_reason = "safe_browsing_request_error"
         exception_message = str(e)
         logger.info(f"[SECURITY] DIAGNOSIS: {exception_type} checking URL {url[:60]}: {e!r}")
         logger.info(f"[SECURITY] Full traceback:\n{traceback.format_exc()}")
@@ -267,7 +275,8 @@ async def scan_url(url: str, email_id: str,
         "url": url, 
         "is_safe": is_safe,  # None = scan_failed, 0 = verdict_unsafe, 1 = verdict_safe
         "threat_type": threat_type,
-        "scan_failed": scan_failed
+        "scan_failed": scan_failed,
+        "reason": failure_reason if scan_failed else None,
     }
 
 

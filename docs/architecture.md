@@ -36,7 +36,7 @@ Gmail Manager is an AI-powered email intelligence platform that provides:
 |---------------|-------|
 | **Architecture Style** | Microservices (Frontend + Backend) |
 | **Authentication** | OAuth 2.0 (Google) |
-| **Database** | PostgreSQL (production), SQLite (test) |
+| **Database** | PostgreSQL (required) |
 | **AI Providers** | Groq (primary), Gemini (secondary), Cohere (tertiary) |
 | **Deployment** | Railway (backend), Vercel (frontend) |
 | **Performance** | p95 latency <200ms, memory <512MB |
@@ -496,7 +496,7 @@ Internet
 
 | Environment | Frontend (Vercel) | Backend (Railway) | Database |
 |------------|-------------------|-------------------|----------|
-| **Development** | localhost:5173 | localhost:8000 | SQLite (local) |
+| **Development** | localhost:5173 | localhost:8000 | PostgreSQL (localhost:5432) |
 | **Test** | localhost:5173 | localhost:8000 | PostgreSQL (localhost:5433) |
 | **Production** | *.vercel.app | *.railway.app | PostgreSQL (Railway managed) |
 

@@ -131,8 +131,8 @@ cp .env.example .env
 
 **Edit `backend/.env`:**
 ```bash
-# Database (use SQLite for local dev)
-SQLITE_DB_PATH=gmail_manager_dev.db
+# Database (PostgreSQL required)
+DATABASE_URL=postgresql://gmail_user:password@localhost:5432/gmail_manager_dev
 
 # Google OAuth
 GOOGLE_CLIENT_ID=your_client_id_here.apps.googleusercontent.com
@@ -201,22 +201,7 @@ npm run dev
 
 ## Database Setup
 
-### Local Development (SQLite)
-
-SQLite is auto-created on first run. No manual setup needed.
-
-```bash
-# Database file location
-backend/gmail_manager_dev.db
-
-# View schema
-sqlite3 backend/gmail_manager_dev.db ".schema"
-
-# Backup
-cp backend/gmail_manager_dev.db backup_$(date +%Y%m%d).db
-```
-
-### Test Environment (PostgreSQL)
+### Local Development (PostgreSQL)
 
 ```bash
 # Install PostgreSQL

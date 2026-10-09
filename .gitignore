@@ -27,7 +27,6 @@ backend/debug_*.py
 backend/test_predict*.py
 backend/verify_*.py
 backend/validate_*.py
-backend/v2_*.py
 backend/v3_*.py
 backend/*_log.txt
 backend/*_output.txt

@@ -1016,13 +1016,25 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                 scan_url(url, email_id, url_client, url_semaphore) for url in selected_urls
             ], return_exceptions=True)
             url_scan_unavailable = len(selected_urls) < urls_total
+            scan_failure_reasons = set()
             for result in scan_results:
-                if isinstance(result, BaseException) or result.get("scan_failed") or result.get("is_safe") is None:
+                if isinstance(result, BaseException):
+                    scan_failure_reasons.add("safe_browsing_request_error")
+                    url_scan_unavailable = True
+                    continue
+                if result.get("scan_failed") or result.get("is_safe") is None:
+                    scan_failure_reasons.add(result.get("reason") or "safe_browsing_request_error")
                     url_scan_unavailable = True
                     continue
                 urls_checked += 1
                 if result.get("is_safe") == 0 and result.get("threat_type"):
                     url_threat_confirmed = True
+            if scan_failure_reasons:
+                logger.warning(
+                    "[PIPELINE] URL scan unavailable for email %s: %s",
+                    email_id[:12],
+                    ", ".join(sorted(scan_failure_reasons)),
+                )
             url_scan_status = (
                 "threat_detected" if url_threat_confirmed else
                 "not_applicable" if not urls_total else
@@ -1078,6 +1090,13 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             label = routed.get("label", "Unknown")
             match = next((name for name in available_label_names
                           if isinstance(label, str) and name.casefold() == label.strip().casefold()), None)
+            if not match:
+                logger.warning(
+                    "[PIPELINE] AI label unavailable for email %s: returned=%r available=%s",
+                    email_id[:12],
+                    label,
+                    available_label_names,
+                )
             category_status = routed.get("category_status", "completed" if match else "unavailable")
             if category_status == "complete":
                 category_status = "completed"

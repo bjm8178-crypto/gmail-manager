@@ -1,0 +1,111 @@
+{
+  "model_version": "v2",
+  "model_type": "Random Forest",
+  "training_date": "2026-09-11T20:04:55.494795",
+  "datasets": {
+    "CEAS_08.csv": {
+      "rows": 39154,
+      "phishing": 21842,
+      "legitimate": 17312
+    },
+    "Enron.csv": {
+      "rows": 29763,
+      "phishing": 13972,
+      "legitimate": 15791
+    },
+    "Ling.csv": {
+      "rows": 2859,
+      "phishing": 458,
+      "legitimate": 2401
+    },
+    "Nazario.csv": {
+      "rows": 1565,
+      "phishing": 1565,
+      "legitimate": 0
+    },
+    "Nigerian_Fraud.csv": {
+      "rows": 3332,
+      "phishing": 3332,
+      "legitimate": 0
+    },
+    "phishing_email.csv": {
+      "rows": 18092,
+      "phishing": 6970,
+      "legitimate": 11122
+    },
+    "phishing_legit_dataset_KD_10000.csv": {
+      "rows": 10000,
+      "phishing": 6000,
+      "legitimate": 4000
+    },
+    "SpamAssasin.csv": {
+      "rows": 5809,
+      "phishing": 1718,
+      "legitimate": 4091
+    },
+    "fradulent_emails.txt": {
+      "rows": 3978,
+      "phishing": 3978,
+      "legitimate": 0
+    }
+  },
+  "total_training_samples": 98466,
+  "total_samples_after_dedup": 100018,
+  "duplicates_removed": 14534,
+  "class_balance": {
+    "phishing": 52603,
+    "legitimate": 47415,
+    "phishing_percentage": 52.59,
+    "used_class_weight": false
+  },
+  "held_out_source": "Nazario",
+  "held_out_samples": 1552,
+  "features": [
+    "num_urls",
+    "has_ip_url",
+    "num_exclamations",
+    "contains_urgent_words",
+    "body_length",
+    "uppercase_ratio",
+    "writing_style_score",
+    "body (TF-IDF)"
+  ],
+  "performance": {
+    "random_test_split": {
+      "samples": 19694,
+      "accuracy": 0.962,
+      "precision": 0.949,
+      "recall": 0.9794,
+      "f1_score": 0.964,
+      "confusion_matrix": [
+        [
+          8945,
+          538
+        ],
+        [
+          210,
+          10001
+        ]
+      ]
+    },
+    "held_out_source": {
+      "source": "Nazario",
+      "samples": 1552,
+      "accuracy": 0.8789,
+      "precision": 1.0,
+      "recall": 0.8789,
+      "f1_score": 0.9355,
+      "confusion_matrix": [
+        [
+          0,
+          0
+        ],
+        [
+          188,
+          1364
+        ]
+      ]
+    }
+  },
+  "training_time_seconds": 228.52
+}

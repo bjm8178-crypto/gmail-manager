@@ -36,7 +36,7 @@ gmail-manager/
 │   ├── gmail.py                # Gmail API + bulk analysis pipeline
 │   ├── ai_router.py            # AI cascade: Groq → Gemini → Cohere
 │   ├── security.py             # URL scanner + Safe Browsing API
-│   ├── database.py             # PostgreSQL + SQLite hybrid
+│   ├── database.py             # PostgreSQL database layer
 │   ├── ml_inference.py         # ML model inference
 │   ├── requirements.txt        # Python dependencies
 │   └── .env                    # API keys (never committed)
@@ -75,7 +75,17 @@ gmail-manager/
 
 - **Python 3.11+** — [python.org](https://www.python.org/downloads/)
 - **Node.js 18+** — [nodejs.org](https://nodejs.org/)
+- **PostgreSQL** — via Docker or local installation
 - **Google Cloud Console** project with Gmail API enabled
+
+---
+
+## 📚 Documentation
+
+- **[Local Setup & Troubleshooting](docs/LOCAL_TROUBLESHOOTING.md)** — Common issues and diagnostic tools
+- **[ML Model Setup](docs/LOCAL_ML_SETUP.md)** — PostgreSQL database and ML model configuration
+- **[Architecture](docs/architecture.md)** — System design and data flow
+- **[Deployment](docs/deployment.md)** — Production deployment guide
 
 ---
 
@@ -280,7 +290,7 @@ The initial migration applies `postgres_schema.sql`. For isolated local verifica
 - OAuth tokens saved to `backend/token.json` — auto-refreshed
 - URL safety results cached 24 hours in database
 - Emails never leave your control — all AI analysis uses your own API keys
-- PostgreSQL for production (Railway), SQLite fallback for local development
+- PostgreSQL database (required for all environments)
 - WCAG AA compliant contrast ratios for accessibility
 
 ---

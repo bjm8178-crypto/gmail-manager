@@ -78,6 +78,42 @@ from schemas import (
 
 # ---------- APP INITIALIZATION ----------
 
+def _log_startup_configuration_warnings() -> None:
+    """Log missing local configuration without changing runtime behavior."""
+    safe_browsing_key = os.getenv("GOOGLE_SAFE_BROWSING_KEY", "").strip().lower()
+    if not safe_browsing_key or safe_browsing_key in {
+        "your_key_here",
+        "replace-with-local-secret",
+        "replace_me",
+        "redacted",
+    }:
+        logger.warning("[STARTUP WARNING] GOOGLE_SAFE_BROWSING_KEY is missing or a placeholder")
+
+    provider_status = get_provider_status()
+    if not any(
+        provider_status.get(provider, {}).get("configured", False)
+        for provider in ("groq", "gemini", "cohere")
+    ):
+        logger.warning("[STARTUP WARNING] No usable Groq, Gemini, or Cohere API key is configured")
+
+    if not os.getenv("SECRET_KEY", "").strip():
+        logger.warning("[STARTUP WARNING] SECRET_KEY is missing")
+    if not os.getenv("DB_ENCRYPTION_KEY", "").strip():
+        logger.warning("[STARTUP WARNING] DB_ENCRYPTION_KEY is missing")
+
+    model_conn = None
+    try:
+        model_conn = _get_connection()
+        model_cursor = model_conn.cursor()
+        _execute(model_cursor, "SELECT 1 FROM ml_models WHERE is_active = 1 LIMIT 1")
+        if model_cursor.fetchone() is None:
+            logger.warning("[STARTUP WARNING] No active row exists in ml_models")
+    except Exception:
+        logger.warning("[STARTUP WARNING] Could not verify an active row in ml_models")
+    finally:
+        if model_conn is not None:
+            _release_connection(model_conn)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -97,6 +133,7 @@ async def lifespan(app: FastAPI):
     logger.info("[STARTUP] Calling init_db()...")
     init_db()
     logger.info("[STARTUP] init_db() complete")
+    _log_startup_configuration_warnings()
     
     # Load active ML model if available
     logger.info("[STARTUP] Calling load_active_model()...")
