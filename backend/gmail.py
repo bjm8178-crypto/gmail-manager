@@ -829,6 +829,9 @@ async def analyze_bulk_ordered(limit: int = 50, user_id: int = None, user_email:
     # Cache labels once per bulk run (instead of per-email DB query)
     available_labels_list = await asyncio.to_thread(get_labels, user_id)
     available_label_names = [lbl["label_name"] for lbl in available_labels_list]
+    
+    if not available_label_names:
+        logger.warning(f"[PIPELINE] Empty label list for user_id={user_id} — analysis will produce unavailable category_status")
 
     async with httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(max_connections=50)) as url_client:
         # Emit initializing event immediately so the frontend gets instant feedback
@@ -1269,6 +1272,9 @@ async def label_only_pipeline(limit: int = None, user_id: int = None, user_email
     # Cache labels once per bulk run (instead of per-email DB query)
     available_labels_list = await asyncio.to_thread(get_labels, user_id)
     available_label_names = [lbl["label_name"] for lbl in available_labels_list]
+    
+    if not available_label_names:
+        logger.warning(f"[PIPELINE] Empty label list for user_id={user_id} — analysis will produce unavailable category_status")
 
     async with httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(max_connections=50)) as url_client:
         yield {"type": "initializing", "message": "Starting AI analysis..."}

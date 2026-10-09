@@ -1,6 +1,6 @@
 """
 Diagnostic script for AI category classification using production code path.
-Tests route_email_with_v2 with 20 synthetic emails.
+Tests route_email_with_v2 with 20 synthetic emails per user_id.
 """
 import sys
 import os
@@ -12,22 +12,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from dotenv import load_dotenv
 load_dotenv()
 
-from database import _get_connection, _release_connection
+from database import _get_connection, _release_connection, get_labels
 from v2_routing import route_email_with_v2
 from ai_router import ai_router, CLASSIFICATION_PROMPT
 
 
-async def diagnose():
-    """Run 20 synthetic emails through route_email_with_v2."""
+async def diagnose_user(user_id: int):
+    """Run 20 synthetic emails through route_email_with_v2 for one user."""
     
-    # Fetch available label names from custom_labels table
-    conn = _get_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT label_name FROM custom_labels ORDER BY label_name')
-    rows = cur.fetchall()
-    available_label_names = [row['label_name'] for row in rows]
-    cur.close()
-    _release_connection(conn)
+    # Fetch available labels for this user (as gmail.py does)
+    available_label_names = [lbl['label_name'] for lbl in get_labels(user_id)]
     
     # 20 synthetic emails (never use real email content)
     emails = [
@@ -72,7 +66,7 @@ async def diagnose():
     
     async def run_one(idx, subject, sender, body):
         """Run one email through route_email_with_v2."""
-        email_id = f"test_{idx:03d}"
+        email_id = f"user{user_id}_test_{idx:03d}"
         
         async def ai_cascade_func():
             prompt = CLASSIFICATION_PROMPT.format(
@@ -81,7 +75,7 @@ async def diagnose():
                 body=body[:6000],
                 url_threat_confirmed=False,
                 url_scan_unavailable=False,
-                available_labels=", ".join(available_label_names),
+                available_labels=", ".join(available_label_names) if available_label_names else "none",
             )
             return await ai_router.analyze_json(prompt)
         
@@ -144,9 +138,7 @@ async def diagnose():
         reason = msg.split(':')[0] if ':' in msg else msg[:80]
         warning_groups[reason] = warning_groups.get(reason, 0) + 1
     
-    print("=" * 60)
-    print("DIAGNOSTIC: 20 Synthetic Emails via route_email_with_v2")
-    print("=" * 60)
+    print(f"=== USER_ID {user_id} ===")
     print(f"Available labels: {available_label_names}")
     print()
     print("category_status counts:")
@@ -171,9 +163,27 @@ async def diagnose():
             print(f"  {reason}: {count}")
     else:
         print("  (none)")
-    print("=" * 60)
     print()
 
 
+async def main():
+    """Run diagnostic for each distinct user_id in analyzed_emails."""
+    
+    # Fetch distinct user_ids from analyzed_emails
+    conn = _get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT user_id FROM analyzed_emails ORDER BY user_id")
+    user_ids = [row['user_id'] for row in cur.fetchall()]
+    cur.close()
+    _release_connection(conn)
+    
+    print(f"Distinct user_ids in analyzed_emails: {user_ids}")
+    print()
+    
+    # Run diagnostic for each user_id
+    for user_id in user_ids:
+        await diagnose_user(user_id)
+
+
 if __name__ == "__main__":
-    asyncio.run(diagnose())
+    asyncio.run(main())

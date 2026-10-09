@@ -121,6 +121,9 @@ async def route_email_with_v2(
                         if isinstance(name, str) and isinstance(label, str)
                         and name.strip() and name.casefold() == label.strip().casefold()), None)
     
+    if not available_label_names:
+        logger.warning('[V2_ROUTER] No available labels — category_status will be unavailable')
+    
     if label_match is not None:
         response['label'] = label_match
         response['category_status'] = 'complete'
