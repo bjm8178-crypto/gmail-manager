@@ -1145,8 +1145,13 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                     if "Suspicious attachment detected" not in indicators:
                         indicators = [*indicators, "Suspicious attachment detected"]
             
+            # Map v2_routing's 'complete' to stored 'completed' for consistency
             analysis_status = routed.get("analysis_status", "completed")
-            if analysis_status != "completed" or url_scan_unavailable or label_id is None:
+            if analysis_status == "complete":
+                analysis_status = "completed"
+            
+            # Downgrade to partial if incomplete conditions exist
+            if url_scan_unavailable or label_id is None:
                 analysis_status = "partial"
             decision = routed.get("routing_decision", "unknown")
             v2_score = routed.get("v2_score")
