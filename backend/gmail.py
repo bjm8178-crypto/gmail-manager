@@ -1058,7 +1058,16 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                     f"verdict={attachment_verdict}, adjustment=+{attachment_scam_adjustment}"
                 )
 
-            from v2_routing import route_email_with_v2
+            # Phase 4: Import V2 router with graceful fallback
+            try:
+                from v2_routing import route_email_with_v2
+                V2_ROUTER_AVAILABLE = True
+            except ImportError as import_err:
+                logger.error("[PIPELINE] V2 router unavailable: %s", str(import_err))
+                V2_ROUTER_AVAILABLE = False
+            except Exception as init_err:
+                logger.error("[PIPELINE] V2 router initialization failed: %s", str(init_err))
+                V2_ROUTER_AVAILABLE = False
 
             async def run_ai_cascade():
                 prompt = classification_prompt.format(
@@ -1069,12 +1078,44 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                 )
                 return await ai_router.analyze_json(prompt)
 
-            routed = await route_email_with_v2(
-                email_id=email_id, subject=subject, sender=sender, body=body, snippet=snippet,
-                ai_cascade_func=run_ai_cascade, classification_prompt=classification_prompt,
-                url_threat_confirmed=url_threat_confirmed, url_scan_unavailable=url_scan_unavailable,
-                available_label_names=available_label_names,
-            )
+            if V2_ROUTER_AVAILABLE:
+                routed = await route_email_with_v2(
+                    email_id=email_id, subject=subject, sender=sender, body=body, snippet=snippet,
+                    ai_cascade_func=run_ai_cascade, classification_prompt=classification_prompt,
+                    url_threat_confirmed=url_threat_confirmed, url_scan_unavailable=url_scan_unavailable,
+                    available_label_names=available_label_names,
+                )
+            else:
+                # Fallback: use AI classification directly when V2 router unavailable
+                logger.warning("[PIPELINE] Using AI-only fallback for %s", email_id[:12])
+                ai_result = await run_ai_cascade()
+                if not isinstance(ai_result, dict):
+                    raise ValueError("AI cascade returned invalid type")
+                
+                data = ai_result.get('data', {})
+                if not isinstance(data, dict):
+                    error_msg = ai_result.get('error', 'No valid analysis from AI providers')
+                    raise ValueError(f"AI analysis failed: {error_msg}")
+                
+                # Validate AI response structure
+                scam_score = data.get('scam_score')
+                if not isinstance(scam_score, int) or not 0 <= scam_score <= 100:
+                    raise ValueError("Invalid scam_score from AI")
+                
+                routed = {
+                    'label': data.get('label', 'Unknown'),
+                    'scam_score': scam_score,
+                    'scam_indicators': data.get('scam_indicators', []),
+                    'reasoning': data.get('reasoning', ''),
+                    'routing_decision': 'ai_only_fallback',
+                    'v2_score': None,
+                    'provider_used': ai_result.get('provider_used'),
+                    'analysis_status': 'partial',  # AI-only is partial (no ML validation)
+                    'category_status': 'pending',
+                    'url_threat_confirmed': url_threat_confirmed,
+                    'url_scan_unavailable': url_scan_unavailable,
+                }
+
             label = routed.get("label", "Unknown")
             match = next((name for name in available_label_names
                           if isinstance(label, str) and name.casefold() == label.strip().casefold()), None)
