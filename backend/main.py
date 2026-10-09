@@ -112,13 +112,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.info(f"[SERVER] Token migration skipped: {e}")
     
-    # Start background scheduler
-    logger.info("[STARTUP] Starting background scheduler...")
-    try:
-        start_scheduler()
-        logger.info("[STARTUP] Background scheduler started successfully")
-    except Exception as e:
-        logger.error(f"[STARTUP ERROR] Failed to start scheduler: {e}", exc_info=True)
+    # Optional scheduler (off for free sleeping hosts).
+    if os.getenv("ENABLE_SCHEDULER", "false").strip().lower() in {"1", "true", "yes", "on"}:
+        logger.info("[STARTUP] Starting background scheduler...")
+        try:
+            start_scheduler()
+            logger.info("[STARTUP] Background scheduler started successfully")
+        except Exception as e:
+            logger.error(f"[STARTUP ERROR] Failed to start scheduler: {e}", exc_info=True)
+    else:
+        logger.info("[STARTUP] Background scheduler disabled by configuration")
     
     # Apply database indices for performance
     logger.info("[STARTUP] Applying database indices...")
