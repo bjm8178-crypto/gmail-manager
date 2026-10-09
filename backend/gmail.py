@@ -1153,8 +1153,9 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             provider_used = routed.get("provider_used")
             if not provider_used and v2_score is not None:
                 provider_used = "local_ml_v2"
-            # This flag is a local review queue, not isolation in Gmail.
-            quarantine = int(url_threat_confirmed or score >= 70)
+            # Apply consolidated quarantine policy
+            from quarantine_policy import should_quarantine
+            quarantine = int(should_quarantine(score, url_threat_confirmed, label))
             persist(
                 label_id=label_id, scam_score=score, scam_indicators=json.dumps(indicators),
                 is_quarantined=quarantine, status="labeled",

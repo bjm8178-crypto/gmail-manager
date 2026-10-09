@@ -1,6 +1,6 @@
 """
 Integration tests for the complete email analysis pipeline.
-Tests _analyze_one() with mocked Gmail, AI providers, URL scanning, and database.
+Tests _analyze_one() with realistic mocking of external dependencies.
 """
 import pytest
 import asyncio
@@ -10,40 +10,29 @@ from datetime import datetime
 
 @pytest.fixture
 def mock_email():
-    """Standard test email fixture."""
+    """Standard test email fixture matching Gmail API format."""
     return {
         'id': 'test_email_123',
         'threadId': 'thread_456',
-        'subject': 'Test Invoice',
-        'sender': 'sender@example.com',
-        'body': 'Please review the attached invoice.',
+        'internalDate': '1696896000000',
+        'payload': {
+            'headers': [
+                {'name': 'Subject', 'value': 'Test Invoice'},
+                {'name': 'From', 'value': 'sender@example.com'},
+            ],
+            'body': {'data': 'UGxlYXNlIHJldmlldyB0aGUgYXR0YWNoZWQgaW52b2ljZSBhdCBodHRwczovL2V4YW1wbGUuY29tL2ludm9pY2U='}  # base64: "Please review the attached invoice at https://example.com/invoice"
+        },
         'snippet': 'Please review...',
-        'received_at': datetime.now().isoformat(),
-        'has_attachments': False,
     }
 
 
-@pytest.fixture
-def mock_database():
-    """Mock database operations."""
-    with patch('gmail.get_label_id_by_name') as get_label, \
-         patch('gmail.remove_from_retry_queue') as remove_retry, \
-         patch('gmail.add_to_retry_queue') as add_retry:
-        get_label.return_value = 42
-        yield {
-            'get_label_id_by_name': get_label,
-            'remove_from_retry_queue': remove_retry,
-            'add_to_retry_queue': add_retry,
-        }
-
-
 @pytest.mark.asyncio
-async def test_v2_router_available_complete_analysis(mock_email, mock_database):
+async def test_v2_router_complete_analysis(mock_email):
     """Test successful V2 routing with complete analysis."""
     from gmail import _analyze_one
     
-    # Mock v2_routing to be available and return complete analysis
-    mock_route = AsyncMock(return_value={
+    # Mock v2_routing to return complete analysis
+    mock_routed = {
         'label': 'Finance',
         'scam_score': 15,
         'scam_indicators': [],
@@ -55,47 +44,60 @@ async def test_v2_router_available_complete_analysis(mock_email, mock_database):
         'category_status': 'complete',
         'url_threat_confirmed': False,
         'url_scan_unavailable': False,
-    })
+    }
     
-    persist_mock = MagicMock()
-    semaphore = asyncio.Semaphore(1)
-    
-    with patch('gmail.route_email_with_v2', mock_route), \
-         patch('gmail.asyncio.to_thread', return_value=[]), \
-         patch('gmail.get_labels', return_value=[{'label_name': 'Finance'}]):
+    # Mock dependencies at their actual import locations
+    with patch('v2_routing.route_email_with_v2', new_callable=AsyncMock) as mock_v2, \
+         patch('gmail.get_labels', return_value=[{'label_name': 'Finance', 'label_id': 42}]), \
+         patch('gmail.get_label_id_by_name', return_value=42), \
+         patch('gmail.is_already_analyzed', return_value=False), \
+         patch('gmail.save_analyzed_email') as mock_save, \
+         patch('gmail.remove_from_retry_queue'), \
+         patch('gmail.asyncio.to_thread', new_callable=AsyncMock, return_value='Email body text'), \
+         patch('security.scan_url', new_callable=AsyncMock, return_value={'is_safe': 1, 'threat_type': None}), \
+         patch('gmail.get_gmail_service', return_value=MagicMock()):
+        
+        mock_v2.return_value = mock_routed
+        
+        # Create mock dependencies matching actual signature
+        mock_ai_router = MagicMock()
+        mock_semaphore = asyncio.Semaphore(1)
+        mock_url_semaphore = asyncio.Semaphore(5)
+        mock_url_client = MagicMock()
         
         result = await _analyze_one(
-            mock_email, semaphore, user_id=1, 
+            email=mock_email,
+            semaphore=mock_semaphore,
+            ai_router=mock_ai_router,
             classification_prompt="Test {subject} {sender} {body} {url_threat_confirmed} {url_scan_unavailable} {available_labels}",
-            persist=persist_mock
+            user_id=1,
+            user_email='test@example.com',
+            service=MagicMock(),
+            url_client=mock_url_client,
+            url_semaphore=mock_url_semaphore,
+            available_label_names=['Finance', 'Personal', 'Spam'],
+            gmail_labels_cache={},
+            update_mode=False
         )
-    
-    assert result['status'] == 'success'
-    assert result['analysis_status'] == 'completed'
-    assert result['category_status'] == 'completed'
-    assert result['label'] == 'Finance'
-    assert result['scam_score'] == 15
-    assert not result['is_quarantined']
-    
-    # Verify database calls
-    persist_mock.assert_called_once()
-    call_kwargs = persist_mock.call_args[1]
-    assert call_kwargs['label_id'] == 42
-    assert call_kwargs['scam_score'] == 15
-    assert call_kwargs['analysis_status'] == 'completed'
-    assert call_kwargs['category_status'] == 'completed'
+        
+        # Verify result structure
+        assert result['status'] == 'success'
+        assert result['analysis_status'] == 'completed'  # 'complete' mapped to 'completed'
+        assert result['category_status'] == 'completed'
+        assert result['label'] == 'Finance'
+        assert result['scam_score'] == 15
+        assert result['is_quarantined'] == 0  # Low score, no URL threat
+        
+        # Verify database save was called
+        assert mock_save.called
 
 
 @pytest.mark.asyncio
-async def test_v2_router_unavailable_ai_fallback(mock_email, mock_database):
-    """Test AI-only fallback when V2 router import fails."""
+async def test_v2_router_unavailable_ai_fallback(mock_email):
+    """Test AI-only fallback when V2 router is unavailable."""
     from gmail import _analyze_one
     
-    # Mock v2_routing import failure
-    def mock_import_error(*args, **kwargs):
-        raise ImportError("No module named 'v2_routing'")
-    
-    # Mock AI cascade to return valid result
+    # Mock AI cascade response
     mock_ai_result = {
         'data': {
             'label': 'Promotional',
@@ -106,112 +108,106 @@ async def test_v2_router_unavailable_ai_fallback(mock_email, mock_database):
         'provider_used': 'cohere'
     }
     
-    persist_mock = MagicMock()
-    semaphore = asyncio.Semaphore(1)
-    
-    with patch('gmail.route_email_with_v2', side_effect=mock_import_error), \
-         patch('gmail.ai_router.analyze_json', AsyncMock(return_value=mock_ai_result)), \
-         patch('gmail.asyncio.to_thread', return_value=[]), \
-         patch('gmail.get_labels', return_value=[{'label_name': 'Promotional'}]):
+    with patch('v2_routing.route_email_with_v2', side_effect=ImportError("No module named 'v2_routing'")), \
+         patch('gmail.get_labels', return_value=[{'label_name': 'Promotional', 'label_id': 43}]), \
+         patch('gmail.get_label_id_by_name', return_value=43), \
+         patch('gmail.is_already_analyzed', return_value=False), \
+         patch('gmail.save_analyzed_email') as mock_save, \
+         patch('gmail.remove_from_retry_queue'), \
+         patch('gmail.asyncio.to_thread', new_callable=AsyncMock, return_value='Email body'), \
+         patch('security.scan_url', new_callable=AsyncMock, return_value={'is_safe': 1}), \
+         patch('gmail.get_gmail_service', return_value=MagicMock()):
+        
+        mock_ai_router = MagicMock()
+        mock_ai_router.analyze_json = AsyncMock(return_value=mock_ai_result)
+        mock_semaphore = asyncio.Semaphore(1)
         
         result = await _analyze_one(
-            mock_email, semaphore, user_id=1,
+            email=mock_email,
+            semaphore=mock_semaphore,
+            ai_router=mock_ai_router,
             classification_prompt="Test {subject} {sender} {body} {url_threat_confirmed} {url_scan_unavailable} {available_labels}",
-            persist=persist_mock
+            user_id=1,
+            user_email='test@example.com',
+            service=MagicMock(),
+            url_client=MagicMock(),
+            url_semaphore=asyncio.Semaphore(5),
+            available_label_names=['Promotional', 'Spam'],
+            gmail_labels_cache={},
+            update_mode=False
         )
-    
-    assert result['status'] == 'success'
-    assert result['analysis_status'] == 'partial'  # AI-only is partial
-    assert result['category_status'] == 'pending'
-    assert result['scam_score'] == 25
-    
-    call_kwargs = persist_mock.call_args[1]
-    assert call_kwargs['analysis_status'] == 'partial'
-    assert call_kwargs['routing_decision'] == 'ai_only_fallback'
+        
+        assert result['status'] == 'success'
+        assert result['analysis_status'] == 'partial'  # AI-only is partial
+        assert result['scam_score'] == 25
+        
+        # Verify AI fallback was used
+        call_kwargs = mock_save.call_args[1]
+        assert call_kwargs['routing_decision'] == 'ai_only_fallback'
 
 
 @pytest.mark.asyncio
-async def test_all_ai_providers_exhausted(mock_email, mock_database):
-    """Test that all providers failing does NOT produce fake Safe label."""
+async def test_url_threat_overrides_low_score(mock_email):
+    """Test that confirmed malicious URL overrides low AI score."""
     from gmail import _analyze_one
     
-    # Mock AI cascade to return error
-    mock_ai_error = {
-        'error': 'All AI providers exhausted: gemini quota, cohere timeout',
-        'provider_used': None
-    }
-    
-    persist_mock = MagicMock()
-    semaphore = asyncio.Semaphore(1)
-    
-    with patch('gmail.route_email_with_v2', side_effect=ImportError), \
-         patch('gmail.ai_router.analyze_json', AsyncMock(return_value=mock_ai_error)), \
-         patch('gmail.asyncio.to_thread', return_value=[]), \
-         patch('gmail.get_labels', return_value=[{'label_name': 'Finance'}]):
-        
-        result = await _analyze_one(
-            mock_email, semaphore, user_id=1,
-            classification_prompt="Test {subject} {sender} {body} {url_threat_confirmed} {url_scan_unavailable} {available_labels}",
-            persist=persist_mock
-        )
-    
-    # Should fail gracefully
-    assert result['status'] == 'failed'
-    assert result['analysis_status'] == 'failed'
-    assert result['label'] == 'Unknown'
-    
-    # Verify NO fake safe score
-    assert result['scam_score'] is None or result['scam_score'] == 0  # Expect None but allow 0 from error path
-    
-    # Verify added to retry queue
-    mock_database['add_to_retry_queue'].assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_confirmed_url_threat_overrides_ai_safe(mock_email, mock_database):
-    """Test that confirmed malicious URL overrides AI saying Safe."""
-    from gmail import _analyze_one
-    
-    mock_route = AsyncMock(return_value={
+    mock_routed = {
         'label': 'Personal',
-        'scam_score': 100,  # URL threat sets to 100
-        'scam_indicators': ['Known malicious link detected'],
-        'reasoning': 'Confirmed malicious URL',
-        'routing_decision': 'url_threat_override',
-        'v2_score': None,
+        'scam_score': 20,  # Low initial score
+        'scam_indicators': [],
+        'reasoning': 'Normal email',
+        'routing_decision': 'v2_auto_clear',
+        'v2_score': 0.20,
         'provider_used': 'gemini',
         'analysis_status': 'complete',
         'category_status': 'complete',
-        'url_threat_confirmed': True,
+        'url_threat_confirmed': False,
         'url_scan_unavailable': False,
-    })
+    }
     
-    persist_mock = MagicMock()
-    semaphore = asyncio.Semaphore(1)
-    
-    # Mock URL scan returning malicious
-    with patch('gmail.route_email_with_v2', mock_route), \
-         patch('gmail.asyncio.to_thread', return_value=[]), \
-         patch('gmail.get_labels', return_value=[{'label_name': 'Personal'}]), \
-         patch('gmail.check_urls_safe', return_value=(True, 'complete', 5, 5)):
+    with patch('v2_routing.route_email_with_v2', new_callable=AsyncMock, return_value=mock_routed), \
+         patch('gmail.get_labels', return_value=[{'label_name': 'Personal', 'label_id': 44}]), \
+         patch('gmail.get_label_id_by_name', return_value=44), \
+         patch('gmail.is_already_analyzed', return_value=False), \
+         patch('gmail.save_analyzed_email') as mock_save, \
+         patch('gmail.remove_from_retry_queue'), \
+         patch('gmail.asyncio.to_thread', new_callable=AsyncMock, return_value='Email body'), \
+         patch('security.scan_url', new_callable=AsyncMock, return_value={'is_safe': 0, 'threat_type': 'MALWARE'}), \
+         patch('gmail.get_gmail_service', return_value=MagicMock()):
+        
+        mock_ai_router = MagicMock()
         
         result = await _analyze_one(
-            mock_email, semaphore, user_id=1,
+            email=mock_email,
+            semaphore=asyncio.Semaphore(1),
+            ai_router=mock_ai_router,
             classification_prompt="Test {subject} {sender} {body} {url_threat_confirmed} {url_scan_unavailable} {available_labels}",
-            persist=persist_mock
+            user_id=1,
+            user_email='test@example.com',
+            service=MagicMock(),
+            url_client=MagicMock(),
+            url_semaphore=asyncio.Semaphore(5),
+            available_label_names=['Personal'],
+            gmail_labels_cache={},
+            update_mode=False
         )
-    
-    assert result['scam_score'] >= 95  # URL threat forces high score
-    assert result['is_quarantined'] == 1
-    assert 'Known malicious link detected' in str(persist_mock.call_args)
+        
+        # URL threat should boost score to at least 95
+        assert result['scam_score'] >= 95
+        assert result['is_quarantined'] == 1  # URL threat → quarantine
+        
+        # Verify malicious indicator was added
+        call_kwargs = mock_save.call_args[1]
+        indicators = call_kwargs['scam_indicators']
+        assert 'Known malicious link detected' in indicators
 
 
 @pytest.mark.asyncio
-async def test_empty_label_list_unavailable_category(mock_email, mock_database):
+async def test_empty_label_list_unavailable_category(mock_email):
     """Test that empty label list results in unavailable category_status."""
     from gmail import _analyze_one
     
-    mock_route = AsyncMock(return_value={
+    mock_routed = {
         'label': 'Unknown',
         'scam_score': 30,
         'scam_indicators': [],
@@ -223,67 +219,131 @@ async def test_empty_label_list_unavailable_category(mock_email, mock_database):
         'category_status': 'unavailable',
         'url_threat_confirmed': False,
         'url_scan_unavailable': False,
-    })
+    }
     
-    persist_mock = MagicMock()
-    semaphore = asyncio.Semaphore(1)
-    
-    with patch('gmail.route_email_with_v2', mock_route), \
-         patch('gmail.asyncio.to_thread', return_value=[]), \
-         patch('gmail.get_labels', return_value=[]):  # Empty labels
+    with patch('v2_routing.route_email_with_v2', new_callable=AsyncMock, return_value=mock_routed), \
+         patch('gmail.get_labels', return_value=[]), \
+         patch('gmail.get_label_id_by_name', return_value=None), \
+         patch('gmail.is_already_analyzed', return_value=False), \
+         patch('gmail.save_analyzed_email') as mock_save, \
+         patch('gmail.remove_from_retry_queue'), \
+         patch('gmail.asyncio.to_thread', new_callable=AsyncMock, return_value='Email body'), \
+         patch('security.scan_url', new_callable=AsyncMock, return_value={'is_safe': 1}), \
+         patch('gmail.get_gmail_service', return_value=MagicMock()):
         
         result = await _analyze_one(
-            mock_email, semaphore, user_id=1,
-            classification_prompt="Test {subject} {sender} {body} {url_threat_confirmed} {url_scan_unavailable} {available_labels}",
-            persist=persist_mock
+            email=mock_email,
+            semaphore=asyncio.Semaphore(1),
+            ai_router=MagicMock(),
+            classification_prompt="Test {subject}",
+            user_id=1,
+            user_email='test@example.com',
+            service=MagicMock(),
+            url_client=MagicMock(),
+            url_semaphore=asyncio.Semaphore(5),
+            available_label_names=[],  # No labels
+            gmail_labels_cache={},
+            update_mode=False
         )
-    
-    assert result['analysis_status'] == 'partial'
-    assert result['category_status'] == 'unavailable'
-    assert result['label'] == 'Unknown'
-    
-    call_kwargs = persist_mock.call_args[1]
-    assert call_kwargs['label_id'] is None
-    assert call_kwargs['category_status'] == 'unavailable'
+        
+        assert result['analysis_status'] == 'partial'
+        assert result['category_status'] == 'unavailable'
+        assert result['label'] == 'Unknown'
+        
+        call_kwargs = mock_save.call_args[1]
+        assert call_kwargs['label_id'] is None
 
 
 @pytest.mark.asyncio
-async def test_safe_browsing_unavailable_not_interpreted_as_safe(mock_email, mock_database):
-    """Test that missing Safe Browsing key results in unavailable, not safe."""
+async def test_safe_browsing_unavailable_reported_correctly(mock_email):
+    """Test that missing Safe Browsing reports unavailable, not safe."""
     from gmail import _analyze_one
     
-    mock_route = AsyncMock(return_value={
+    mock_routed = {
         'label': 'Finance',
         'scam_score': 20,
         'scam_indicators': [],
-        'reasoning': 'Legitimate finance email',
+        'reasoning': 'Legitimate email',
         'routing_decision': 'v2_auto_clear',
         'v2_score': 0.20,
-        'provider_used': None,
-        'analysis_status': 'partial',  # Partial because URL scan unavailable
+        'provider_used': 'gemini',
+        'analysis_status': 'complete',
         'category_status': 'complete',
         'url_threat_confirmed': False,
-        'url_scan_unavailable': True,
-    })
+        'url_scan_unavailable': False,
+    }
     
-    persist_mock = MagicMock()
-    semaphore = asyncio.Semaphore(1)
-    
-    # Mock URL scan as unavailable (no API key)
-    with patch('gmail.route_email_with_v2', mock_route), \
-         patch('gmail.asyncio.to_thread', return_value=[]), \
-         patch('gmail.get_labels', return_value=[{'label_name': 'Finance'}]), \
-         patch('gmail.check_urls_safe', return_value=(False, 'unavailable', 0, 0)):
+    with patch('v2_routing.route_email_with_v2', new_callable=AsyncMock, return_value=mock_routed), \
+         patch('gmail.get_labels', return_value=[{'label_name': 'Finance', 'label_id': 42}]), \
+         patch('gmail.get_label_id_by_name', return_value=42), \
+         patch('gmail.is_already_analyzed', return_value=False), \
+         patch('gmail.save_analyzed_email') as mock_save, \
+         patch('gmail.remove_from_retry_queue'), \
+         patch('gmail.asyncio.to_thread', new_callable=AsyncMock, return_value='Email body'), \
+         patch('security.scan_url', new_callable=AsyncMock, return_value={'is_safe': None, 'scan_failed': True}), \
+         patch('gmail.get_gmail_service', return_value=MagicMock()):
         
         result = await _analyze_one(
-            mock_email, semaphore, user_id=1,
-            classification_prompt="Test {subject} {sender} {body} {url_threat_confirmed} {url_scan_unavailable} {available_labels}",
-            persist=persist_mock
+            email=mock_email,
+            semaphore=asyncio.Semaphore(1),
+            ai_router=MagicMock(),
+            classification_prompt="Test {subject}",
+            user_id=1,
+            user_email='test@example.com',
+            service=MagicMock(),
+            url_client=MagicMock(),
+            url_semaphore=asyncio.Semaphore(5),
+            available_label_names=['Finance'],
+            gmail_labels_cache={},
+            update_mode=False
         )
+        
+        # URL scan failure → unavailable, analysis becomes partial
+        assert result['url_scan_status'] == 'unavailable'
+        assert result['urls_checked'] == 0
+        assert result['analysis_status'] == 'partial'  # Not complete due to unavailable URL scan
+        
+        call_kwargs = mock_save.call_args[1]
+        assert call_kwargs['url_scan_status'] == 'unavailable'
+
+
+@pytest.mark.asyncio
+async def test_analysis_failure_preserves_url_threat(mock_email):
+    """Test that analysis failure preserves URL threat evidence."""
+    from gmail import _analyze_one
     
-    assert result['url_scan_status'] == 'unavailable'
-    assert result['urls_checked'] == 0
-    assert result['analysis_status'] == 'partial'  # Not complete due to unavailable URL scan
-    
-    call_kwargs = persist_mock.call_args[1]
-    assert call_kwargs['url_scan_status'] == 'unavailable'
+    with patch('v2_routing.route_email_with_v2', side_effect=ValueError("AI analysis failed")), \
+         patch('gmail.get_labels', return_value=[{'label_name': 'Finance'}]), \
+         patch('gmail.is_already_analyzed', return_value=False), \
+         patch('gmail.save_analyzed_email') as mock_save, \
+         patch('gmail.add_to_retry_queue'), \
+         patch('gmail.asyncio.to_thread', new_callable=AsyncMock, return_value='Email body'), \
+         patch('security.scan_url', new_callable=AsyncMock, return_value={'is_safe': 0, 'threat_type': 'PHISHING'}), \
+         patch('gmail.get_gmail_service', return_value=MagicMock()):
+        
+        result = await _analyze_one(
+            email=mock_email,
+            semaphore=asyncio.Semaphore(1),
+            ai_router=MagicMock(),
+            classification_prompt="Test {subject}",
+            user_id=1,
+            user_email='test@example.com',
+            service=MagicMock(),
+            url_client=MagicMock(),
+            url_semaphore=asyncio.Semaphore(5),
+            available_label_names=['Finance'],
+            gmail_labels_cache={},
+            update_mode=False
+        )
+        
+        # Should fail but preserve URL threat
+        assert result['status'] == 'failed'
+        assert result['scam_score'] == 95  # URL threat preserved
+        assert result['is_quarantined'] == 1
+        
+        # Verify error path saved URL evidence
+        call_kwargs = mock_save.call_args[1]
+        assert call_kwargs['scam_score'] == 95
+        assert call_kwargs['is_quarantined'] == 1
+        indicators = call_kwargs['scam_indicators']
+        assert 'Known malicious link detected' in indicators

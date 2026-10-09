@@ -1432,11 +1432,9 @@ async def reanalyze_scam_email(
     if scam_indicators is None or not isinstance(scam_indicators, list):
         scam_indicators = []
 
-    # Quarantine flag — same rule as the bulk pipeline
-    is_quarantined = 0
-    label_is_spam_like = label == "Spam" or "scam" in label.lower()
-    if scam_score >= 70 and url_threat_confirmed and label_is_spam_like:
-        is_quarantined = 1
+    # Apply consolidated quarantine policy
+    from quarantine_policy import should_quarantine
+    is_quarantined = int(should_quarantine(scam_score, url_threat_confirmed, label))
 
     # Resolve label_id and persist
     label_id = get_label_id_by_name(user_id, label)
