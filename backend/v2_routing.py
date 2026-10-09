@@ -68,29 +68,60 @@ async def route_email_with_v2(
 
     try:
         ai_result = await ai_cascade_func()
-    except Exception:
-        logger.warning('[V2_ROUTER] AI classification unavailable')
+    except Exception as e:
+        provider_info = ""
+        logger.warning(
+            '[V2_ROUTER] AI cascade raised %s: %s%s',
+            type(e).__name__,
+            str(e)[:120],
+            provider_info
+        )
         ai_result = {}
+    
     if not isinstance(ai_result, dict):
+        logger.warning('[V2_ROUTER] AI result not a dict: got %s', type(ai_result).__name__)
         ai_result = {}
+    
     data = ai_result.get('data')
+    provider = ai_result.get('provider_used')
+    provider_str = f" (provider: {provider})" if isinstance(provider, str) and provider.strip() else ""
+    
     if not isinstance(data, dict):
+        logger.warning('[V2_ROUTER] No dict under data key%s', provider_str)
         data = {}
+    
     indicators = data.get('scam_indicators', [])
     reasoning = data.get('reasoning', '')
     if (not isinstance(indicators, list) or not all(isinstance(item, str) for item in indicators)
             or not isinstance(reasoning, str)):
+        logger.warning(
+            '[V2_ROUTER] Data discarded: scam_indicators or reasoning validation failed%s',
+            provider_str
+        )
         data = {}
-    provider = ai_result.get('provider_used')
+    
     provider = provider if isinstance(provider, str) and provider.strip() else None
     label = data.get('label')
+    
+    if not label or not isinstance(label, str):
+        if data:  # Only log if we had valid data but missing/invalid label
+            logger.warning('[V2_ROUTER] Label missing or not a string%s', provider_str)
+    
     label_match = next((name for name in (available_label_names or [])
                         if isinstance(name, str) and isinstance(label, str)
                         and name.strip() and name.casefold() == label.strip().casefold()), None)
+    
     if label_match is not None:
         response['label'] = label_match
         response['category_status'] = 'complete'
         response['provider_used'] = provider
+    elif isinstance(label, str) and label.strip() and available_label_names:
+        logger.warning(
+            '[V2_ROUTER] Label mismatch: returned "%s", available: %s%s',
+            label[:40],
+            available_label_names,
+            provider_str
+        )
 
     if url_threat_confirmed:
         response.update(scam_score=100, scam_indicators=['Confirmed malicious URL'],
