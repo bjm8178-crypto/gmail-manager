@@ -23,10 +23,10 @@ from datetime import datetime, timedelta
 # Add backend directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from backend.main import app
-from backend.database import _get_connection, init_db
-from backend.encryption import encrypt_key, decrypt_key
-from backend.logger_setup import SecretRedactionFilter
+from main import app
+from database import _get_connection, init_db
+from encryption import encrypt_key, decrypt_key
+from logger_setup import SecretRedactionFilter
 
 client = TestClient(app)
 

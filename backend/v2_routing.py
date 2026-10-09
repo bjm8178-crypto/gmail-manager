@@ -87,7 +87,17 @@ async def route_email_with_v2(
     provider_str = f" (provider: {provider})" if isinstance(provider, str) and provider.strip() else ""
     
     if not isinstance(data, dict):
-        logger.warning('[V2_ROUTER] No dict under data key%s', provider_str)
+        error_msg = ai_result.get('error', '')
+        if isinstance(error_msg, str) and error_msg:
+            # Redact secrets: key=..., AIza..., gsk_..., Bearer ...
+            import re
+            error_msg = re.sub(r'key=[^&\s]+', '[REDACTED]', error_msg)
+            error_msg = re.sub(r'AIza[0-9A-Za-z_-]+', '[REDACTED]', error_msg)
+            error_msg = re.sub(r'gsk_[A-Za-z0-9]+', '[REDACTED]', error_msg)
+            error_msg = re.sub(r'Bearer\s+\S+', 'Bearer [REDACTED]', error_msg)
+            logger.warning('[V2_ROUTER] No dict under data key, error: %s%s', error_msg[:300], provider_str)
+        else:
+            logger.warning('[V2_ROUTER] No dict under data key%s', provider_str)
         data = {}
     
     indicators = data.get('scam_indicators', [])

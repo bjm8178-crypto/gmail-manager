@@ -16,6 +16,7 @@ import json
 import asyncio
 import time
 import httpx
+import re
 from datetime import datetime
 from pathlib import Path
 from collections import deque
@@ -26,6 +27,15 @@ from dotenv import load_dotenv
 _BACKEND_ROOT = Path(__file__).resolve().parent
 load_dotenv(_BACKEND_ROOT / ".env", override=False)
 load_dotenv(_BACKEND_ROOT.parent / ".env", override=False)
+
+
+def _redact_secrets(text: str) -> str:
+    """Redact API keys and tokens from error messages."""
+    text = re.sub(r'key=[^&\s]+', '[REDACTED]', text)
+    text = re.sub(r'AIza[0-9A-Za-z_-]+', '[REDACTED]', text)
+    text = re.sub(r'gsk_[A-Za-z0-9]+', '[REDACTED]', text)
+    text = re.sub(r'Bearer\s+\S+', 'Bearer [REDACTED]', text)
+    return text
 
 
 # ---------- API KEYS ----------
@@ -388,7 +398,7 @@ class AIRouter:
                     continue  # Try next key immediately
 
                 if response.status_code != 200:
-                    error_msg = f"Groq key #{key_index + 1} error {response.status_code}: {response.text[:200]}"
+                    error_msg = f"Groq key #{key_index + 1} error {response.status_code}: {_redact_secrets(response.text[:200])}"
                     other_errors.append(error_msg)
                     logger.info(f"[AI] {error_msg}, trying next key...")
                     continue  # Try next key
@@ -405,7 +415,7 @@ class AIRouter:
                 logger.info(f"[AI] {error_msg}, trying next key...")
                 continue  # Try next key
             except Exception as e:
-                error_msg = f"Groq key #{key_index + 1} exception: {e}"
+                error_msg = f"Groq key #{key_index + 1} exception: {_redact_secrets(str(e))}"
                 other_errors.append(error_msg)
                 logger.info(f"[AI] {error_msg}, trying next key...")
                 continue  # Try next key

@@ -18,8 +18,8 @@ from datetime import datetime
 # Add backend directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from backend.main import app
-from backend.database import init_db, _get_connection
+from main import app
+from database import init_db, _get_connection
 
 client = TestClient(app)
 
