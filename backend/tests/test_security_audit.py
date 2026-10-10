@@ -23,10 +23,10 @@ from datetime import datetime, timedelta
 # Add backend directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from backend.main import app
-from backend.database import _get_connection, init_db
-from backend.encryption import encrypt_key, decrypt_key
-from backend.logger_setup import SecretRedactionFilter
+from main import app
+from database import _get_connection, init_db
+from encryption import encrypt_key, decrypt_key
+from logger_setup import SecretRedactionFilter
 
 client = TestClient(app)
 
@@ -299,7 +299,7 @@ class TestCSRFProtection:
     def test_csrf_middleware_active(self):
         """Verify CSRF protection middleware is configured."""
         # Check that CSRF-related functionality exists
-        from backend.csrf import generate_csrf_token, validate_csrf_request
+        from csrf import generate_csrf_token, validate_csrf_request
         
         # Generate token
         token = generate_csrf_token()
@@ -375,7 +375,7 @@ class TestSQLInjectionProtection:
         finally:
             cursor.close()
             if hasattr(conn, 'putconn'):
-                from backend.database import _pg_pool
+                from database import _pg_pool
                 _pg_pool.putconn(conn)
             else:
                 conn.close()
@@ -477,7 +477,7 @@ class TestCrossUserAccessPrevention:
     def test_database_queries_filtered_by_user_id(self):
         """Verify database queries include user_id filtering."""
         # Code review verification: check that database.py functions use user_id
-        from backend import database
+        import database
         import inspect
         
         # Key functions that should require user_id

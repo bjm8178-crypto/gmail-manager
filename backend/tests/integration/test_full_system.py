@@ -18,8 +18,8 @@ from datetime import datetime
 # Add backend directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from backend.main import app
-from backend.database import init_db, _get_connection
+from main import app
+from database import init_db, _get_connection
 
 client = TestClient(app)
 
@@ -176,7 +176,7 @@ class TestFullSystemIntegration:
             
             if hasattr(conn, 'putconn'):
                 # PostgreSQL connection pool
-                from backend.database import _pg_pool
+                from database import _pg_pool
                 _pg_pool.putconn(conn)
             else:
                 # SQLite connection
@@ -370,7 +370,7 @@ class TestDatabaseOperations:
             cursor.close()
             
             if hasattr(conn, 'putconn'):
-                from backend.database import _pg_pool
+                from database import _pg_pool
                 _pg_pool.putconn(conn)
             else:
                 conn.close()
@@ -395,7 +395,7 @@ class TestDatabaseOperations:
             cursor.close()
             
             if hasattr(conn, 'putconn'):
-                from backend.database import _pg_pool
+                from database import _pg_pool
                 _pg_pool.putconn(conn)
             else:
                 conn.close()
