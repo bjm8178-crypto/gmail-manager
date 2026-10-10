@@ -1,0 +1,54 @@
+============================= test session starts =============================
+platform win32 -- Python 3.14.4, pytest-9.0.3, pluggy-1.6.0 -- C:\Python314\python.exe
+cachedir: .pytest_cache
+PySide6 6.11.1 -- Qt runtime 6.11.1 -- Qt compiled 6.11.1
+rootdir: C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend
+configfile: pytest.ini
+testpaths: tests
+plugins: anyio-4.13.0, asyncio-1.4.0, cov-7.1.0, mock-3.15.1, qt-4.5.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=function, asyncio_default_test_loop_scope=function
+collecting ... collected 81 items / 4 errors
+
+=================================== ERRORS ====================================
+___________ ERROR collecting tests/integration/test_full_system.py ____________
+tests\integration\test_full_system.py:24: in <module>
+    client = TestClient(app)
+             ^^^^^^^^^^^^^^^
+C:\Python314\Lib\site-packages\starlette\testclient.py:429: in __init__
+    super().__init__(
+E   TypeError: Client.__init__() got an unexpected keyword argument 'app'
+------------------------------- Captured stderr -------------------------------
+2026-10-10 11:52:36,549 - database - INFO - [DB] Using Postgres (DATABASE_URL detected) with connection pool (2-50 connections)
+2026-10-10 11:52:42,391 - ai_router - INFO - [AI ROUTER] Providers loaded: groq=0 keys, cloudflare=False, mistral=False, gemini=True, cohere=True, zai=False, nvidia=True, openrouter=False, llm7=keyless, kilo=keyless, ovh=keyless
+2026-10-10 11:52:42,929 - main - INFO - [CORS] Dev mode - Allowed origins: ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:5174', 'https://gmail-manager-gamma.vercel.app']
+___________ ERROR collecting tests/integration/test_integration.py ____________
+tests\integration\test_integration.py:19: in <module>
+    client = TestClient(app)
+             ^^^^^^^^^^^^^^^
+C:\Python314\Lib\site-packages\starlette\testclient.py:429: in __init__
+    super().__init__(
+E   TypeError: Client.__init__() got an unexpected keyword argument 'app'
+_____________ ERROR collecting tests/test_performance_baseline.py _____________
+tests\test_performance_baseline.py:25: in <module>
+    client = TestClient(app)
+             ^^^^^^^^^^^^^^^
+C:\Python314\Lib\site-packages\starlette\testclient.py:429: in __init__
+    super().__init__(
+E   TypeError: Client.__init__() got an unexpected keyword argument 'app'
+________________ ERROR collecting tests/test_security_audit.py ________________
+tests\test_security_audit.py:31: in <module>
+    client = TestClient(app)
+             ^^^^^^^^^^^^^^^
+C:\Python314\Lib\site-packages\starlette\testclient.py:429: in __init__
+    super().__init__(
+E   TypeError: Client.__init__() got an unexpected keyword argument 'app'
+------------------------------- Captured stderr -------------------------------
+2026-10-10 11:52:43,543 - encryption - INFO - [ENCRYPTION] V2 key loaded - rotation enabled
+2026-10-10 11:52:43,543 - encryption - INFO - [ENCRYPTION] Active key version: 2
+=========================== short test summary info ===========================
+ERROR tests/integration/test_full_system.py - TypeError: Client.__init__() got an unexpected keyword argument 'app'
+ERROR tests/integration/test_integration.py - TypeError: Client.__init__() got an unexpected keyword argument 'app'
+ERROR tests/test_performance_baseline.py - TypeError: Client.__init__() got an unexpected keyword argument 'app'
+ERROR tests/test_security_audit.py - TypeError: Client.__init__() got an unexpected keyword argument 'app'
+!!!!!!!!!!!!!!!!!!! Interrupted: 4 errors during collection !!!!!!!!!!!!!!!!!!!
+======================= 70 warnings, 4 errors in 10.55s =======================

@@ -1,0 +1,333 @@
+============================= test session starts =============================
+platform win32 -- Python 3.14.4, pytest-9.0.3, pluggy-1.6.0 -- C:\Python314\python.exe
+cachedir: .pytest_cache
+PySide6 6.11.1 -- Qt runtime 6.11.1 -- Qt compiled 6.11.1
+rootdir: C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend
+configfile: pytest.ini
+testpaths: tests
+plugins: anyio-4.13.0, asyncio-1.4.0, cov-7.1.0, mock-3.15.1, qt-4.5.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=function, asyncio_default_test_loop_scope=function
+collecting ... collected 123 items
+
+tests/integration/test_full_system.py::TestFullSystemIntegration::test_health_endpoint_returns_complete_status PASSED [  0%]
+tests/integration/test_full_system.py::TestFullSystemIntegration::test_ml_metadata_endpoint_accessible PASSED [  1%]
+tests/integration/test_full_system.py::TestFullSystemIntegration::test_cors_headers_configured PASSED [  2%]
+tests/integration/test_full_system.py::TestFullSystemIntegration::test_security_headers_present PASSED [  3%]
+tests/integration/test_full_system.py::TestFullSystemIntegration::test_database_connectivity PASSED [  4%]
+tests/integration/test_full_system.py::TestFullSystemIntegration::test_full_system_startup_successful PASSED [  4%]
+tests/integration/test_full_system.py::TestFullSystemIntegration::test_scheduler_operational PASSED [  5%]
+tests/integration/test_full_system.py::TestFullSystemIntegration::test_logging_system_operational PASSED [  6%]
+tests/integration/test_full_system.py::TestFullSystemIntegration::test_api_endpoints_no_500_errors PASSED [  7%]
+tests/integration/test_full_system.py::TestDatabaseOperations::test_database_schema_loaded SKIPPED
+LINE 1: SELECT COUNT(*) as count FROM
+emails LIMIT 1
+                                      ^)                                 [  8%]
+tests/integration/test_full_system.py::TestDatabaseOperations::test_database_indices_applied PASSED [  8%]
+tests/integration/test_full_system.py::test_integration_suite_summary PASSED [  9%]
+tests/integration/test_integration.py::test_health_endpoint_integration PASSED [ 10%]
+tests/integration/test_integration.py::test_ml_metadata_endpoint_integration PASSED [ 11%]
+tests/integration/test_integration.py::test_cors_headers_integration PASSED [ 12%]
+tests/integration/test_integration.py::test_rate_limiting_integration PASSED [ 13%]
+tests/integration/test_integration.py::test_security_headers_integration PASSED [ 13%]
+tests/integration/test_integration.py::test_gzip_compression_integration PASSED [ 14%]
+tests/test_analysis_pipeline_integration.py::test_v2_router_complete_analysis PASSED [ 15%]
+tests/test_analysis_pipeline_integration.py::test_v2_router_unavailable_ai_fallback PASSED [ 16%]
+tests/test_analysis_pipeline_integration.py::test_url_threat_overrides_low_score PASSED [ 17%]
+tests/test_analysis_pipeline_integration.py::test_empty_label_list_unavailable_category PASSED [ 17%]
+tests/test_analysis_pipeline_integration.py::test_safe_browsing_unavailable_reported_correctly PASSED [ 18%]
+tests/test_analysis_pipeline_integration.py::test_analysis_failure_preserves_url_threat PASSED [ 19%]
+tests/test_auth_hardening.py::OAuthTests::test_additional_granted_scope_is_accepted_and_preserved PASSED [ 20%]
+tests/test_auth_hardening.py::OAuthTests::test_duplicate_scope_tokens_are_deduplicated_and_accepted PASSED [ 21%]
+tests/test_auth_hardening.py::OAuthTests::test_exact_scope_match_succeeds_with_real_oauthlib_parsing PASSED [ 21%]
+tests/test_auth_hardening.py::OAuthTests::test_first_login_creates_user_before_token_update PASSED [ 22%]
+tests/test_auth_hardening.py::OAuthTests::test_google_email_profile_aliases_are_equivalent_for_required_scopes PASSED [ 23%]
+tests/test_auth_hardening.py::OAuthTests::test_include_client_id_and_pkce_are_forwarded_to_real_token_request PASSED [ 24%]
+tests/test_auth_hardening.py::OAuthTests::test_malformed_scope_response_fails_before_userinfo_or_persistence PASSED [ 25%]
+tests/test_auth_hardening.py::OAuthTests::test_missing_required_scope_fails_before_userinfo_or_persistence_even_with_relax_flag PASSED [ 26%]
+tests/test_auth_hardening.py::OAuthTests::test_real_flow_constructs_oauth2session_with_requested_scopes PASSED [ 26%]
+tests/test_auth_hardening.py::OAuthTests::test_rfc_invalid_scope_tokens_fail_before_userinfo_or_persistence 
+tests/test_auth_hardening.py::OAuthTests::test_rfc_invalid_scope_tokens_fail_before_userinfo_or_persistence PASSED [ 27%]
+tests/test_auth_hardening.py::OAuthTests::test_scope_omitted_in_response_succeeds_per_rfc6749 PASSED [ 28%]
+tests/test_auth_hardening.py::StateTests::test_state_is_browser_bound_expiring_and_single_use PASSED [ 29%]
+tests/test_auth_hardening.py::EndpointTests::test_attachment_declared_aggregate_rejected_before_read PASSED [ 30%]
+tests/test_auth_hardening.py::EndpointTests::test_callback_rejects_missing_state_before_exchange PASSED [ 30%]
+tests/test_auth_hardening.py::EndpointTests::test_rewrite_rejects_oversize_stream_before_provider PASSED [ 31%]
+tests/test_auth_hardening.py::EndpointTests::test_rewrite_route_requires_auth PASSED [ 32%]
+tests/test_cross_user_access.py::OwnershipProtectionTests::test_add_to_retry_queue_requires_user_id PASSED [ 33%]
+tests/test_cross_user_access.py::OwnershipProtectionTests::test_mark_retry_attempt_requires_user_id PASSED [ 34%]
+tests/test_cross_user_access.py::OwnershipProtectionTests::test_update_email_label_id_requires_user_id PASSED [ 34%]
+tests/test_database_reliability.py::test_metadata_roundtrip_and_scoped_update ERROR [ 35%]
+tests/test_database_reliability.py::test_received_order_falls_back_to_analysis ERROR [ 36%]
+tests/test_database_reliability.py::test_upsert_preserves_children_and_rejects_cross_account ERROR [ 37%]
+tests/test_deployment_smoke.py::test_v2_routing_import PASSED            [ 38%]
+tests/test_deployment_smoke.py::test_core_dependencies_import PASSED     [ 39%]
+tests/test_deployment_smoke.py::test_optional_predict_module PASSED      [ 39%]
+tests/test_deployment_smoke.py::test_gmail_pipeline_imports PASSED       [ 40%]
+tests/test_deployment_smoke.py::test_ai_router_import PASSED             [ 41%]
+tests/test_gmail_reliability.py::GmailActionsTests::test_apply_api_failure_raises PASSED [ 42%]
+tests/test_gmail_reliability.py::GmailActionsTests::test_apply_confirmed_returns_true PASSED [ 43%]
+tests/test_gmail_reliability.py::GmailActionsTests::test_apply_readback_must_contain_label PASSED [ 43%]
+tests/test_gmail_reliability.py::GmailActionsTests::test_apply_unavailable_raises PASSED [ 44%]
+tests/test_gmail_reliability.py::GmailActionsTests::test_received_timestamp_uses_internal_date PASSED [ 45%]
+tests/test_gmail_reliability.py::AnalysisTests::test_evidence_and_account_are_persisted PASSED [ 46%]
+tests/test_gmail_reliability.py::AnalysisTests::test_failure_is_not_zero_risk PASSED [ 47%]
+tests/test_gmail_reliability.py::AnalysisTests::test_local_model_fallback_records_provider_marker PASSED [ 47%]
+tests/test_gmail_reliability.py::AnalysisTests::test_partial_link_coverage_is_persisted PASSED [ 48%]
+tests/test_gmail_reliability.py::AnalysisTests::test_review_first_does_not_modify_gmail PASSED [ 49%]
+tests/test_gmail_reliability.py::AnalysisTests::test_threat_review_is_independent_of_category PASSED [ 50%]
+tests/test_gmail_reliability.py::AnalysisTests::test_unknown_category_never_uses_first_label PASSED [ 51%]
+tests/test_performance_baseline.py::TestAPIEndpointPerformance::test_health_endpoint_latency PASSED [ 52%]
+tests/test_performance_baseline.py::TestAPIEndpointPerformance::test_ml_metadata_endpoint_latency PASSED [ 52%]
+tests/test_performance_baseline.py::TestMemoryUsage::test_memory_usage_baseline PASSED [ 53%]
+tests/test_performance_baseline.py::TestMemoryUsage::test_memory_usage_under_load PASSED [ 54%]
+tests/test_performance_baseline.py::TestThroughputBaseline::test_sequential_request_throughput PASSED [ 55%]
+tests/test_performance_baseline.py::TestResponseTimeConsistency::test_response_time_variance PASSED [ 56%]
+tests/test_performance_baseline.py::TestPerformanceBaselineSummary::test_performance_baseline_summary PASSED [ 56%]
+tests/test_quarantine_policy.py::TestQuarantinePolicy::test_url_threat_always_quarantines_regardless_of_score PASSED [ 57%]
+tests/test_quarantine_policy.py::TestQuarantinePolicy::test_high_score_quarantines_without_url_threat PASSED [ 58%]
+tests/test_quarantine_policy.py::TestQuarantinePolicy::test_low_score_without_url_threat_does_not_quarantine PASSED [ 59%]
+tests/test_quarantine_policy.py::TestQuarantinePolicy::test_label_does_not_affect_quarantine_decision PASSED [ 60%]
+tests/test_quarantine_policy.py::TestQuarantinePolicy::test_invalid_scam_score_defaults_to_url_threat_only PASSED [ 60%]
+tests/test_quarantine_policy.py::TestQuarantinePolicy::test_boundary_conditions PASSED [ 61%]
+tests/test_quarantine_policy.py::TestQuarantinePolicy::test_both_conditions_true PASSED [ 62%]
+tests/test_routing_security.py::RoutingTests::test_ai_invalid_shapes_cannot_create_verdicts 
+tests/test_routing_security.py::RoutingTests::test_ai_invalid_shapes_cannot_create_verdicts PASSED [ 63%]
+tests/test_routing_security.py::RoutingTests::test_category_is_independent_of_model_and_url_verdict 
+tests/test_routing_security.py::RoutingTests::test_category_is_independent_of_model_and_url_verdict PASSED [ 64%]
+tests/test_routing_security.py::RoutingTests::test_category_validation_and_canonicalization 
+tests/test_routing_security.py::RoutingTests::test_category_validation_and_canonicalization PASSED [ 65%]
+tests/test_routing_security.py::RoutingTests::test_confirmed_url_overrides_every_model_band_and_ai 
+tests/test_routing_security.py::RoutingTests::test_confirmed_url_overrides_every_model_band_and_ai PASSED [ 65%]
+tests/test_routing_security.py::RoutingTests::test_invalid_ai_numbers_are_not_coerced_clamped_or_defaulted 
+tests/test_routing_security.py::RoutingTests::test_invalid_ai_numbers_are_not_coerced_clamped_or_defaulted PASSED [ 66%]
+tests/test_routing_security.py::RoutingTests::test_invalid_model_probabilities_fall_back_to_valid_ai 
+tests/test_routing_security.py::RoutingTests::test_invalid_model_probabilities_fall_back_to_valid_ai PASSED [ 67%]
+tests/test_routing_security.py::RoutingTests::test_missing_category_is_unknown_never_first_label_or_spam 
+tests/test_routing_security.py::RoutingTests::test_missing_category_is_unknown_never_first_label_or_spam PASSED [ 68%]
+tests/test_routing_security.py::RoutingTests::test_provider_exception_cannot_erase_malicious_evidence PASSED [ 69%]
+tests/test_routing_security.py::RoutingTests::test_unavailable_analysis_raises_with_nullable_risk PASSED [ 69%]
+tests/test_scheduler.py::test_cleanup_old_logs_uses_backend_relative_logs_directory PASSED [ 70%]
+tests/test_scheduler.py::test_cleanup_old_logs_removes_old_files PASSED  [ 71%]
+tests/test_scheduler.py::test_cleanup_old_logs_keeps_recent_files PASSED [ 72%]
+tests/test_scheduler.py::test_cleanup_old_logs_handles_missing_directory PASSED [ 73%]
+tests/test_scheduler.py::test_cleanup_old_logs_ignores_non_log_files PASSED [ 73%]
+tests/test_scheduler.py::test_process_retry_queue_retries_owned_pending_emails_with_exact_ids PASSED [ 74%]
+tests/test_scheduler.py::test_process_retry_queue_enforces_batch_bound_and_skips_missing_credentials PASSED [ 75%]
+tests/test_scheduler.py::test_warm_ml_model_cache_loads_active_model PASSED [ 76%]
+tests/test_scheduler.py::test_warm_ml_model_cache_runs_without_error PASSED [ 77%]
+tests/test_scheduler.py::test_start_scheduler_retries_after_failed_start PASSED [ 78%]
+tests/test_scheduler.py::test_start_scheduler_creates_instance PASSED    [ 78%]
+tests/test_scheduler.py::test_scheduler_status_when_running PASSED       [ 79%]
+tests/test_scheduler.py::test_scheduler_status_when_stopped PASSED       [ 80%]
+tests/test_scheduler.py::test_shutdown_scheduler_gracefully PASSED       [ 81%]
+tests/test_scheduler.py::test_start_scheduler_idempotent PASSED          [ 82%]
+tests/test_scheduler.py::test_shutdown_scheduler_when_not_started PASSED [ 82%]
+tests/test_security_audit.py::TestOAuthTokenEncryption::test_encrypt_key_produces_non_json_blob PASSED [ 83%]
+tests/test_security_audit.py::TestOAuthTokenEncryption::test_decrypt_key_recovers_original_data PASSED [ 84%]
+tests/test_security_audit.py::TestOAuthTokenEncryption::test_encrypted_token_not_readable_without_key PASSED [ 85%]
+tests/test_security_audit.py::TestJWTSecureCookie::test_jwt_not_in_response_body PASSED [ 86%]
+tests/test_security_audit.py::TestJWTSecureCookie::test_auth_endpoints_use_cookies_not_body PASSED [ 86%]
+tests/test_security_audit.py::TestAPIKeyRedaction::test_secret_redaction_filter_redacts_api_keys PASSED [ 87%]
+tests/test_security_audit.py::TestAPIKeyRedaction::test_api_keys_pattern_detection PASSED [ 88%]
+tests/test_security_audit.py::TestAPIKeyRedaction::test_log_files_do_not_contain_secrets PASSED [ 89%]
+tests/test_security_audit.py::TestCSRFProtection::test_unauthenticated_post_rejected PASSED [ 90%]
+tests/test_security_audit.py::TestCSRFProtection::test_csrf_middleware_active PASSED [ 91%]
+tests/test_security_audit.py::TestSQLInjectionProtection::test_parameterized_queries_prevent_injection PASSED [ 91%]
+tests/test_security_audit.py::TestSQLInjectionProtection::test_database_uses_parameterized_queries PASSED [ 92%]
+tests/test_security_audit.py::TestSecurityHeaders::test_security_headers_present_in_response PASSED [ 93%]
+tests/test_security_audit.py::TestSecurityHeaders::test_content_security_policy_configured PASSED [ 94%]
+tests/test_security_audit.py::TestCrossUserAccessPrevention::test_cross_user_email_access_prevented PASSED [ 95%]
+tests/test_security_audit.py::TestCrossUserAccessPrevention::test_database_queries_filtered_by_user_id PASSED [ 95%]
+tests/test_security_audit.py::TestSecurityAuditSummary::test_security_audit_complete PASSED [ 96%]
+tests/test_security_unavailable.py::SafeBrowsingUnavailableTests::test_api_rate_limit_returns_unavailable PASSED [ 97%]
+tests/test_security_unavailable.py::SafeBrowsingUnavailableTests::test_api_timeout_returns_unavailable_not_safe PASSED [ 98%]
+tests/test_security_unavailable.py::SafeBrowsingUnavailableTests::test_missing_api_key_returns_unavailable_not_safe PASSED [ 99%]
+tests/test_security_unavailable.py::SafeBrowsingUnavailableTests::test_placeholder_api_key_returns_unavailable PASSED [100%]C:\Python314\Lib\site-packages\coverage\report_core.py:113: CoverageWarning: Couldn't parse 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\pyscript': No source for code: 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\pyscript'. (couldnt-parse); see https://coverage.readthedocs.io/en/7.13.5/messages.html#warning-couldnt-parse
+  coverage._warn(msg, slug="couldnt-parse")
+C:\Python314\Lib\site-packages\coverage\report_core.py:113: CoverageWarning: Couldn't parse 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\__init__.py': No source for code: 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\__init__.py'. (couldnt-parse); see https://coverage.readthedocs.io/en/7.13.5/messages.html#warning-couldnt-parse
+  coverage._warn(msg, slug="couldnt-parse")
+C:\Python314\Lib\site-packages\coverage\report_core.py:113: CoverageWarning: Couldn't parse 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\feature.py': No source for code: 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\feature.py'. (couldnt-parse); see https://coverage.readthedocs.io/en/7.13.5/messages.html#warning-couldnt-parse
+  coverage._warn(msg, slug="couldnt-parse")
+C:\Python314\Lib\site-packages\coverage\report_core.py:113: CoverageWarning: Couldn't parse 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\__init__.py': No source for code: 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\__init__.py'. (couldnt-parse); see https://coverage.readthedocs.io/en/7.13.5/messages.html#warning-couldnt-parse
+  coverage._warn(msg, slug="couldnt-parse")
+C:\Python314\Lib\site-packages\coverage\report_core.py:113: CoverageWarning: Couldn't parse 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\errorhandler.py': No source for code: 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\errorhandler.py'. (couldnt-parse); see https://coverage.readthedocs.io/en/7.13.5/messages.html#warning-couldnt-parse
+  coverage._warn(msg, slug="couldnt-parse")
+C:\Python314\Lib\site-packages\coverage\report_core.py:113: CoverageWarning: Couldn't parse 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\importhandler.py': No source for code: 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\importhandler.py'. (couldnt-parse); see https://coverage.readthedocs.io/en/7.13.5/messages.html#warning-couldnt-parse
+  coverage._warn(msg, slug="couldnt-parse")
+C:\Python314\Lib\site-packages\coverage\report_core.py:113: CoverageWarning: Couldn't parse 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\layout.py': No source for code: 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\layout.py'. (couldnt-parse); see https://coverage.readthedocs.io/en/7.13.5/messages.html#warning-couldnt-parse
+  coverage._warn(msg, slug="couldnt-parse")
+C:\Python314\Lib\site-packages\coverage\report_core.py:113: CoverageWarning: Couldn't parse 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\lib\__init__.py': No source for code: 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\lib\__init__.py'. (couldnt-parse); see https://coverage.readthedocs.io/en/7.13.5/messages.html#warning-couldnt-parse
+  coverage._warn(msg, slug="couldnt-parse")
+C:\Python314\Lib\site-packages\coverage\report_core.py:113: CoverageWarning: Couldn't parse 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\lib\enum_sig.py': No source for code: 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\lib\enum_sig.py'. (couldnt-parse); see https://coverage.readthedocs.io/en/7.13.5/messages.html#warning-couldnt-parse
+  coverage._warn(msg, slug="couldnt-parse")
+C:\Python314\Lib\site-packages\coverage\report_core.py:113: CoverageWarning: Couldn't parse 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\lib\pyi_generator.py': No source for code: 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\lib\pyi_generator.py'. (couldnt-parse); see https://coverage.readthedocs.io/en/7.13.5/messages.html#warning-couldnt-parse
+  coverage._warn(msg, slug="couldnt-parse")
+C:\Python314\Lib\site-packages\coverage\report_core.py:113: CoverageWarning: Couldn't parse 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\lib\tool.py': No source for code: 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\lib\tool.py'. (couldnt-parse); see https://coverage.readthedocs.io/en/7.13.5/messages.html#warning-couldnt-parse
+  coverage._warn(msg, slug="couldnt-parse")
+C:\Python314\Lib\site-packages\coverage\report_core.py:113: CoverageWarning: Couldn't parse 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\loader.py': No source for code: 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\loader.py'. (couldnt-parse); see https://coverage.readthedocs.io/en/7.13.5/messages.html#warning-couldnt-parse
+  coverage._warn(msg, slug="couldnt-parse")
+C:\Python314\Lib\site-packages\coverage\report_core.py:113: CoverageWarning: Couldn't parse 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\mapping.py': No source for code: 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\mapping.py'. (couldnt-parse); see https://coverage.readthedocs.io/en/7.13.5/messages.html#warning-couldnt-parse
+  coverage._warn(msg, slug="couldnt-parse")
+C:\Python314\Lib\site-packages\coverage\report_core.py:113: CoverageWarning: Couldn't parse 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\parser.py': No source for code: 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\shibokensupport\signature\parser.py'. (couldnt-parse); see https://coverage.readthedocs.io/en/7.13.5/messages.html#warning-couldnt-parse
+  coverage._warn(msg, slug="couldnt-parse")
+C:\Python314\Lib\site-packages\coverage\report_core.py:113: CoverageWarning: Couldn't parse 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\signature_bootstrap.py': No source for code: 'C:\Users\Administrator\Desktop\GMAIL PROJECT\gmail-manager\backend\signature_bootstrap.py'. (couldnt-parse); see https://coverage.readthedocs.io/en/7.13.5/messages.html#warning-couldnt-parse
+  coverage._warn(msg, slug="couldnt-parse")
+
+ERROR: Coverage failure: total of 25 is less than fail-under=45
+
+
+=================================== ERRORS ====================================
+_________ ERROR at setup of test_metadata_roundtrip_and_scoped_update _________
+tests\test_database_reliability.py:46: in db
+    spec.loader.exec_module(module)
+<frozen importlib._bootstrap_external>:759: in exec_module
+    ???
+<frozen importlib._bootstrap>:491: in _call_with_frames_removed
+    ???
+database.py:30: in <module>
+    raise RuntimeError("SQLite is disabled; unset FORCE_SQLITE and configure DATABASE_URL for PostgreSQL")
+E   RuntimeError: SQLite is disabled; unset FORCE_SQLITE and configure DATABASE_URL for PostgreSQL
+________ ERROR at setup of test_received_order_falls_back_to_analysis _________
+tests\test_database_reliability.py:46: in db
+    spec.loader.exec_module(module)
+<frozen importlib._bootstrap_external>:759: in exec_module
+    ???
+<frozen importlib._bootstrap>:491: in _call_with_frames_removed
+    ???
+database.py:30: in <module>
+    raise RuntimeError("SQLite is disabled; unset FORCE_SQLITE and configure DATABASE_URL for PostgreSQL")
+E   RuntimeError: SQLite is disabled; unset FORCE_SQLITE and configure DATABASE_URL for PostgreSQL
+_ ERROR at setup of test_upsert_preserves_children_and_rejects_cross_account __
+tests\test_database_reliability.py:46: in db
+    spec.loader.exec_module(module)
+<frozen importlib._bootstrap_external>:759: in exec_module
+    ???
+<frozen importlib._bootstrap>:491: in _call_with_frames_removed
+    ???
+database.py:30: in <module>
+    raise RuntimeError("SQLite is disabled; unset FORCE_SQLITE and configure DATABASE_URL for PostgreSQL")
+E   RuntimeError: SQLite is disabled; unset FORCE_SQLITE and configure DATABASE_URL for PostgreSQL
+=============================== tests coverage ================================
+_______________ coverage: platform win32, python 3.14.4-final-0 _______________
+
+Name                                          Stmts   Miss  Cover   Missing
+---------------------------------------------------------------------------
+activate_model.py                                80     80     0%   7-135
+ai_response_schema.py                            67     39    42%   67-76, 82-84, 112-121, 137-141, 157-161, 177-190
+ai_router.py                                    353    267    24%   55, 58, 60, 90, 159-176, 290-330, 353-417, 435-492, 511-541, 560-603, 609-643, 649-675, 681-707, 713-740, 744-766, 770-792, 797-826, 833-869
+api_compression.py                               37     11    70%   32, 36, 42, 61-80
+apply_indices.py                                 43     43     0%   7-71
+attachment_scanner.py                           109     91    17%   104-201, 233-286, 302-304, 309-310, 320-344
+audit.py                                        123    123     0%   9-322
+auth.py                                         215     96    55%   75-95, 103-107, 115-118, 126-129, 134-147, 155-158, 167-197, 212-216, 237-239, 261-263, 278-285, 288, 297, 346-347, 402-403, 406-407, 436
+benchmark_vectorization.py                       83     83     0%   4-115
+cache_manager.py                                100     72    28%   29-44, 48-59, 63-66, 70-74, 78-81, 105-126, 138-159, 166-176, 181
+csrf.py                                          47      8    83%   42-43, 49-50, 62-65
+database.py                                     700    565    19%   32, 60-66, 79, 98-99, 132-134, 138-139, 143-144, 146-147, 152-153, 257-258, 261-267, 270-276, 300-301, 345-352, 357-360, 370-400, 407-430, 435-448, 458-474, 479-502, 507-520, 525-552, 557-567, 590-602, 611-633, 641-653, 660-673, 682-720, 725-740, 745-758, 774-810, 823-844, 859-873, 881-904, 919-945, 951-964, 975-996, 1003-1024, 1044-1061, 1078-1129, 1134-1150, 1161-1175, 1180-1199, 1204-1218, 1223-1233, 1240-1250, 1255-1273, 1278-1291, 1301-1324, 1329-1342, 1349-1359, 1364-1379, 1391-1414, 1424-1446, 1454-1476
+debug_predict.py                                 12     12     0%   2-15
+decision_policy.py                               28      9    68%   66, 77, 101, 112, 172, 190-194, 219
+dependencies.py                                  13      9    31%   16-25, 33
+diagnose_and_compare.py                          66     66     0%   4-94
+diagnose_features_fixed.py                      153    153     0%   5-245
+diagnose_features_short_emails.py               125    125     0%   4-215
+diagnose_mismatch.py                             46     46     0%   4-68
+diagnose_v2_optimized.py                        156    156     0%   5-236
+diagnose_v2_step1_step2.py                      145    145     0%   5-242
+encryption.py                                    42     13    69%   22, 55, 69, 78-79, 83-92, 97
+features.py                                      59     44    25%   40-78, 83, 88-90, 95-97, 105-113, 118-119, 124-129, 137-151, 156-161, 166-170, 185-212
+fix_null_scam_scores.py                          25     25     0%   8-44
+fix_postgres_placeholders.py                     49     49     0%   1-101
+gmail.py                                        665    492    26%   37-44, 61-128, 142-143, 164-169, 178-230, 238-243, 252-264, 273-284, 297-444, 477-480, 485, 493-503, 523-562, 592-612, 617-627, 632-642, 658-731, 739-748, 755-784, 799-938, 952-953, 956-957, 1001, 1042-1044, 1051-1056, 1068-1070, 1093, 1097-1098, 1103, 1129, 1132, 1140-1146, 1196-1197, 1207-1208, 1218-1261, 1275-1368
+jwt_auth.py                                      51     33    35%   21, 40-50, 63-71, 76, 89-99, 120-136
+logger_setup.py                                  41      3    93%   42, 64-66
+main.py                                         927    685    26%   88-148, 167, 196-208, 235, 240-243, 248-251, 259-292, 330-331, 340-430, 439-440, 450-512, 519-540, 549-550, 560-570, 576-579, 594-616, 629-638, 644-657, 671-734, 755-837, 854-871, 887-916, 930-953, 968-1034, 1047-1049, 1055-1057, 1070-1076, 1097-1103, 1117-1120, 1126-1134, 1142-1145, 1153-1155, 1168-1172, 1181-1184, 1198-1205, 1219-1228, 1239, 1248-1266, 1279-1283, 1290-1292, 1299-1307, 1315-1319, 1336-1452, 1476-1498, 1522, 1524, 1531, 1536-1567, 1579-1621, 1627-1635, 1647, 1719, 1722, 1733-1737, 1745-1746, 1748-1751, 1755-1756, 1764-1768, 1774-1776, 1781-1784, 1835-1856, 1876-1914, 1935-1956, 1975-1996, 2018-2046, 2060-2068, 2101-2139, 2157, 2166-2167
+migrate_to_postgres.py                          146    146     0%   1-253
+ml_data_audit.py                                 45     45     0%   6-83
+ml_inference.py                                 112     83    26%   52-80, 87, 105-113, 133-195, 205-217, 230-250, 258-284
+ml_monitor.py                                    87     87     0%   6-158
+ml_readiness_check.py                            59     59     0%   8-111
+predict.py                                      107     94    12%   23-30, 46-114, 147-206, 225-275, 280-330
+quarantine_policy.py                             15      0   100%
+response_compression.py                          34     34     0%   6-70
+scheduler.py                                    121     27    78%   34-52, 57-67, 80-81, 94, 106-107, 131, 141-152, 177-178, 242, 268-269
+schemas.py                                       65     18    72%   58-60, 81-87, 134-136, 156-158, 174-176
+security.py                                     161     77    52%   54-74, 83-90, 118-119, 130-131, 187-188, 198-208, 212-219, 229-252, 257-260, 311-312, 315-317
+security_headers.py                              17      2    88%   21-22
+show_patch_diff.py                               41     41     0%   6-204
+test_ai_response_schema.py                       85     85     0%   4-205
+test_ai_router_key_loading.py                    88     88     0%   2-210
+test_alembic.py                                  39     39     0%   3-68
+test_api_contract.py                             27     27     0%   3-70
+test_api_key_headers.py                          23     23     0%   1-32
+test_attachment_persistence_contract.py          39     39     0%   6-65
+test_attachment_scanner.py                      192    192     0%   6-377
+test_audit_connection_lifecycle.py                7      7     0%   3-12
+test_audit_dialect.py                            12     12     0%   3-17
+test_audit_logging.py                           171    171     0%   6-371
+test_audit_sql_injection.py                      12     12     0%   3-30
+test_authenticated_analysis_flow.py              19     19     0%   2-37
+test_bulk_label.py                               32     32     0%   3-42
+test_bulk_operations.py                          82     82     0%   11-171
+test_csrf_cookie_delivery.py                     53     53     0%   6-112
+test_csrf_protection.py                          35     35     0%   1-60
+test_csrf_regression.py                          64     64     0%   12-137
+test_database_initialization_failure.py          38     38     0%   3-63
+test_decision_policy.py                          74     74     0%   5-237
+test_dependencies.py                             37     37     0%   3-57
+test_email_updates.py                            37     37     0%   3-81
+test_encryption_versioning.py                    50     50     0%   1-64
+test_exact_retry_ids.py                          26     26     0%   7-69
+test_explicit_state_model.py                     79     79     0%   5-186
+test_feature_extraction.py                       52     52     0%   3-131
+test_health_endpoint.py                         121    121     0%   6-214
+test_jwt_cookie.py                               23     23     0%   1-33
+test_label_operations.py                         44     44     0%   3-94
+test_label_rollback.py                           10     10     0%   3-23
+test_label_status_contract.py                     5      5     0%   2-11
+test_latest_email_priority.py                    80     80     0%   7-189
+test_ml_integrity.py                             88     88     0%   3-153
+test_ml_metadata_endpoint.py                    123    123     0%   5-267
+test_oauth_token_encryption.py                   58     58     0%   1-74
+test_postgres_only_contract.py                   11     11     0%   2-18
+test_predict_v2.py                               67     67     0%   5-138
+test_rate_limiting.py                            41     41     0%   11-146
+test_request_validation.py                      205    205     0%   9-427
+test_retry_limits.py                             48     48     0%   3-65
+test_retry_queue_index.py                        24     24     0%   3-39
+test_safebrowsing_connectivity.py                83     83     0%   12-141
+test_schema_parity.py                            44     44     0%   3-85
+test_secret_redaction.py                         15     15     0%   1-20
+test_security_headers.py                         22     22     0%   1-34
+test_short_informal_emails.py                    95     95     0%   5-246
+tests\integration\test_full_system.py           175     35    80%   88-97, 179-180, 193, 199-200, 274-277, 302-304, 325-328, 362-378, 398-399, 407-408
+tests\integration\test_integration.py            41      6    85%   49-54
+tests\test_analysis_pipeline_integration.py      91      0   100%
+tests\test_auth_hardening.py                    237      1    99%   443
+tests\test_cross_user_access.py                  31      1    97%   84
+tests\test_database_reliability.py               55     38    31%   12-25, 29-34, 47-51, 55-58, 62-72
+tests\test_deployment_smoke.py                   37     12    68%   18-19, 33-34, 43-48, 56-57, 65-66
+tests\test_gmail_reliability.py                 103      1    99%   139
+tests\test_performance_baseline.py              190      3    98%   43, 61, 253
+tests\test_quarantine_policy.py                  32      0   100%
+tests\test_routing_security.py                  102      2    98%   87, 129
+tests\test_scheduler.py                         147      1    99%   225
+tests\test_security_audit.py                    223     18    92%   242, 247, 268-270, 360-363, 371, 378-379, 419, 424, 449, 505, 510, 520-522
+tests\test_security_unavailable.py               55      1    98%   143
+train_model.py                                  353    353     0%   9-633
+train_model_fast.py                             117    117     0%   8-234
+v2_routing.py                                    97     11    89%   24-26, 93-98, 125, 180
+validate_cross_source.py                        280    280     0%   9-437
+validate_routing_bands.py                       152    152     0%   5-254
+verify_features.py                              125    125     0%   8-188
+verify_features_comparison.py                   150    150     0%   5-277
+verify_features_quick.py                         63     63     0%   5-94
+verify_fixed_datasets.py                         70     70     0%   5-93
+---------------------------------------------------------------------------
+TOTAL                                         11076   8276    25%
+Coverage HTML written to dir htmlcov
+FAIL Required test coverage of 45% not reached. Total coverage: 25.28%
+=========================== short test summary info ===========================
+ERROR tests/test_database_reliability.py::test_metadata_roundtrip_and_scoped_update - RuntimeError: SQLite is disabled; unset FORCE_SQLITE and configure DATABASE_URL for PostgreSQL
+ERROR tests/test_database_reliability.py::test_received_order_falls_back_to_analysis - RuntimeError: SQLite is disabled; unset FORCE_SQLITE and configure DATABASE_URL for PostgreSQL
+ERROR tests/test_database_reliability.py::test_upsert_preserves_children_and_rejects_cross_account - RuntimeError: SQLite is disabled; unset FORCE_SQLITE and configure DATABASE_URL for PostgreSQL
+= 119 passed, 1 skipped, 512 warnings, 3 errors, 45 subtests passed in 37.72s =
