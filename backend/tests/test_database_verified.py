@@ -23,13 +23,17 @@ def mock_pg_connection():
 def test_get_emails_by_ids_returns_email_list(mock_pg_connection):
     """Test get_emails_by_ids retrieves multiple emails by ID"""
     mock_conn, mock_cursor = mock_pg_connection
-    # Mock row objects with keys() and values() for dict() conversion
+    # Mock psycopg2.extras.RealDictRow - dict() calls __iter__ which yields (key, value) tuples
     mock_row1 = MagicMock()
-    mock_row1.keys.return_value = ["email_id", "sender", "subject", "scam_score", "is_quarantined", "snippet"]
-    mock_row1.__iter__ = lambda self: iter(["email1", "user@test.com", "Subject 1", 10, 0, "snippet1"])
+    mock_row1.__iter__ = lambda self: iter([
+        ("email_id", "email1"), ("sender", "user@test.com"), ("subject", "Subject 1"), 
+        ("scam_score", 10), ("is_quarantined", 0), ("snippet", "snippet1")
+    ])
     mock_row2 = MagicMock()
-    mock_row2.keys.return_value = ["email_id", "sender", "subject", "scam_score", "is_quarantined", "snippet"]
-    mock_row2.__iter__ = lambda self: iter(["email2", "user@test.com", "Subject 2", 5, 0, "snippet2"])
+    mock_row2.__iter__ = lambda self: iter([
+        ("email_id", "email2"), ("sender", "user@test.com"), ("subject", "Subject 2"),
+        ("scam_score", 5), ("is_quarantined", 0), ("snippet", "snippet2")
+    ])
     mock_cursor.fetchall.return_value = [mock_row1, mock_row2]
     
     with patch('database._pg_pool') as mock_pool:
