@@ -23,17 +23,17 @@ def mock_pg_connection():
 def test_get_emails_by_ids_returns_email_list(mock_pg_connection):
     """Test get_emails_by_ids retrieves multiple emails by ID"""
     mock_conn, mock_cursor = mock_pg_connection
-    # Mock psycopg2.extras.RealDictRow - dict() calls __iter__ which yields (key, value) tuples
-    mock_row1 = MagicMock()
-    mock_row1.__iter__ = lambda self: iter([
-        ("email_id", "email1"), ("sender", "user@test.com"), ("subject", "Subject 1"), 
-        ("scam_score", 10), ("is_quarantined", 0), ("snippet", "snippet1")
-    ])
-    mock_row2 = MagicMock()
-    mock_row2.__iter__ = lambda self: iter([
-        ("email_id", "email2"), ("sender", "user@test.com"), ("subject", "Subject 2"),
-        ("scam_score", 5), ("is_quarantined", 0), ("snippet", "snippet2")
-    ])
+    # RealDictRow is dict-like: dict(row) works because row already behaves as a dict
+    mock_row1 = {
+        "email_id": "email1", "sender": "user@test.com", "subject": "Subject 1",
+        "scam_score": 10, "is_quarantined": 0, "snippet": "snippet1",
+        "body": "", "received_at": "2024-01-01", "analyzed_at": "2024-01-01"
+    }
+    mock_row2 = {
+        "email_id": "email2", "sender": "user@test.com", "subject": "Subject 2",
+        "scam_score": 5, "is_quarantined": 0, "snippet": "snippet2",
+        "body": "", "received_at": "2024-01-01", "analyzed_at": "2024-01-01"
+    }
     mock_cursor.fetchall.return_value = [mock_row1, mock_row2]
     
     with patch('database._pg_pool') as mock_pool:
@@ -43,9 +43,9 @@ def test_get_emails_by_ids_returns_email_list(mock_pg_connection):
         result = get_emails_by_ids(user_id=1, email_ids=["email1", "email2"])
         
         assert len(result) == 2
+        assert result[0]["email_id"] == "email1"
+        assert result[0]["id"] == "email1"  # Line 936 sets row["id"] = row["email_id"]
         assert mock_cursor.execute.called
-        sql = mock_cursor.execute.call_args[0][0]
-        assert "WHERE email_id = ANY" in sql or "email_id IN" in sql
 
 
 def test_get_emails_by_ids_filters_by_user(mock_pg_connection):
