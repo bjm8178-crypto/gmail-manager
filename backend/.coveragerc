@@ -1,0 +1,54 @@
+# Coverage.py configuration for Gmail Manager backend
+# Measures only production runtime code, excludes development/testing scripts
+
+[run]
+source = .
+omit =
+    # Test files
+    tests/*
+    test_*.py
+    conftest.py
+    
+    # ML training and model development scripts (offline only)
+    train_*.py
+    activate_model.py
+    
+    # Diagnostic and validation utilities (development only)
+    diagnose_*.py
+    validate_*.py
+    verify_*.py
+    benchmark_*.py
+    
+    # Database migration and repair scripts (run manually)
+    migrate_*.py
+    fix_*.py
+    apply_*.py
+    
+    # Debug and development utilities
+    debug_*.py
+    show_*.py
+    ml_data_audit.py
+    ml_readiness_check.py
+    
+    # Python environment
+    */__pycache__/*
+    */venv/*
+    */env/*
+    setup.py
+
+[report]
+# Exclude defensive code patterns from coverage requirements
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise AssertionError
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    if TYPE_CHECKING:
+    @abstractmethod
+precision = 2
+# Show only files with missing coverage for clearer reports
+skip_covered = False
+
+[html]
+directory = htmlcov
