@@ -19,10 +19,9 @@ omit =
     verify_*.py
     benchmark_*.py
     
-    # Database migration and repair scripts (run manually)
+    # Database migration and repair scripts (run manually, except apply_indices.py)
     migrate_*.py
     fix_*.py
-    apply_*.py
     
     # Debug and development utilities
     debug_*.py
