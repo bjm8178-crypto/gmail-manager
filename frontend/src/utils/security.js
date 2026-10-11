@@ -2,10 +2,11 @@
 export function securitySummary(email = {}) {
   const status = email.analysis_status || email.status || 'unknown';
   const complete = ['completed', 'analyzed'].includes(status);
+  const partial = status === 'partial';
   const score = typeof email.scam_score === 'number' && Number.isFinite(email.scam_score) && email.scam_score >= 0 && email.scam_score <= 100 ? email.scam_score : null;
-  const level = score >= 70 ? 'high' : score >= 40 ? 'medium' : complete && score !== null ? 'low' : 'unknown';
-  const label = {high:'High estimated risk',medium:'Suspicious',low:'Low estimated risk',unknown:status === 'failed' ? 'Analysis failed' : 'Not fully assessed'}[level];
-  return {level, score, complete, status, label};
+  const level = score >= 70 ? 'high' : score >= 40 ? 'medium' : (complete || partial) && score !== null ? 'low' : 'unknown';
+  const label = {high:'High estimated risk',medium:'Suspicious',low: partial ? 'Low risk so far (partial scan)' : 'Low estimated risk',unknown:status === 'failed' ? 'Analysis failed' : 'Not fully assessed'}[level];
+  return {level, score, complete, partial, status, label};
 }
 export function reviewStatus(email) {
   if (email.user_decision === 'safe') return 'user_safe';

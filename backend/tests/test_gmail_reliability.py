@@ -108,11 +108,11 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.db.update_analyzed_email.call_args.kwargs['scam_score'])
 
     async def test_partial_link_coverage_is_persisted(self):
-        self.security.extract_urls.return_value = [f'https://example.test/{i}' for i in range(24)]
+        self.security.extract_urls.return_value = [f'https://example.test/{i}' for i in range(40)]
         await self.analyze()
         saved = self.db.update_analyzed_email.call_args.kwargs
-        self.assertEqual(saved['urls_total'], 24)
-        self.assertEqual(saved['urls_checked'], 10)
+        self.assertEqual(saved['urls_total'], 40)
+        self.assertEqual(saved['urls_checked'], 30)
         self.assertEqual(saved['url_scan_status'], 'partial')
         self.assertEqual(saved['analysis_status'], 'partial')
 

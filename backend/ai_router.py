@@ -796,7 +796,6 @@ class AIRouter:
         """Run a prompt through the configured provider cascade."""
         providers = [
             ("Groq", self._call_groq),
-            ("NVIDIA", self._call_nvidia),
             ("Gemini", self._call_gemini),
             ("Cohere", self._call_cohere),
             ("OpenRouter", self._call_openrouter),

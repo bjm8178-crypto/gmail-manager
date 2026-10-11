@@ -965,6 +965,8 @@ def _analysis_text(body: str) -> str:
     return " ".join(" ".join(parser.parts).split())
 
 
+MAX_URLS_SCANNED = 30
+
 async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                        ai_router, classification_prompt: str,
                        user_id: int, user_email: str, service,
@@ -1011,7 +1013,7 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
 
             urls = list(dict.fromkeys(extract_urls(body)))
             urls_total = len(urls)
-            selected_urls = urls[:10]
+            selected_urls = urls[:MAX_URLS_SCANNED]
             scan_results = await asyncio.gather(*[
                 scan_url(url, email_id, url_client, url_semaphore) for url in selected_urls
             ], return_exceptions=True)

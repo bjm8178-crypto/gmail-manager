@@ -1,0 +1,35 @@
+services:
+  # Backend API
+  - type: web
+    name: gmail-manager-api
+    runtime: python
+    buildCommand: "cd backend && pip install -r requirements.txt"
+    startCommand: "cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: GEMINI_API_KEY
+        sync: false  # Set manually in dashboard for security
+      - key: COHERE_API_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: DB_ENCRYPTION_KEY
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: gmail-manager-db
+          property: connectionString
+      - key: ALLOWED_ORIGIN
+        value: https://gmail-manager-app.bjm8178-gmail.workers.dev
+      - key: FRONTEND_URL
+        value: https://gmail-manager-app.bjm8178-gmail.workers.dev
+      - key: GOOGLE_SAFE_BROWSING_KEY
+        sync: false
+
+databases:
+  - name: gmail-manager-db
+    databaseName: gmail_manager
+    user: gmail_manager

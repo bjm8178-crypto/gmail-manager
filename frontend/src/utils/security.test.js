@@ -3,10 +3,11 @@ import assert from 'node:assert/strict';
 import { securitySummary, reviewStatus, parseIndicators } from './security.js';
 import { emailCsp } from './emailPrivacy.js';
 test('missing, failed and partial scans cannot be low risk', () => {
- for (const email of [{}, {scam_score:0,status:'failed'}, {scam_score:0,analysis_status:'partial'}, {scam_score:0,status:'fetched'}]) assert.equal(securitySummary(email).level, 'unknown');
+ for (const email of [{}, {scam_score:0,status:'failed'}, {scam_score:0,status:'fetched'}]) assert.equal(securitySummary(email).level, 'unknown');
 });
 test('completed analysis describes estimate, not a safety guarantee', () => {
  assert.equal(securitySummary({scam_score:0,analysis_status:'completed'}).label,'Low estimated risk');
+ assert.equal(securitySummary({scam_score:0,analysis_status:'partial'}).label,'Low risk so far (partial scan)');
  assert.equal(securitySummary({scam_score:90,analysis_status:'partial'}).label,'High estimated risk');
 });
 test('user decision never erases original risk', () => {
