@@ -17,6 +17,7 @@ backend/tokens/
 backend/archive/
 *.pkl
 backend/*.pkl
+!backend/scam_classifier_v2.pkl
 backend/scam_classifier*.pkl
 backend/model_metadata*.json
 backend/checkpoints/

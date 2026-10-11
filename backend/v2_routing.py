@@ -19,8 +19,12 @@ AUTO_CLEAR_THRESHOLD = float(os.getenv('V2_AUTO_CLEAR_THRESHOLD', '0.40'))
 AUTO_FLAG_THRESHOLD = float(os.getenv('V2_AUTO_FLAG_THRESHOLD', '0.85'))
 
 try:
-    from predict import predict_email
-    V2_AVAILABLE = True
+    import predict as _predict
+    predict_email = _predict.predict_email
+    _model_file = getattr(_predict, '_model_path', None)
+    V2_AVAILABLE = _model_file is None or _model_file.exists()
+    if not V2_AVAILABLE:
+        logger.warning('[V2_ROUTER] Model file missing (%s); running AI-only', _model_file)
 except Exception:
     V2_AVAILABLE = False
     logger.warning('[V2_ROUTER] Local model unavailable')
