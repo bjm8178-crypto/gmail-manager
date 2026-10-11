@@ -14,6 +14,8 @@ backend/tokens/
 *.env.backup
 
 # Machine Learning models (large binary files - should be stored separately)
+backend/archive/
+*.pkl
 backend/*.pkl
 backend/scam_classifier*.pkl
 backend/model_metadata*.json
