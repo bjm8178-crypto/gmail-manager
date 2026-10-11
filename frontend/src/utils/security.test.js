@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { securitySummary, reviewStatus, parseIndicators } from './security.js';
 import { emailCsp } from './emailPrivacy.js';
-test('missing, failed and partial scans cannot be low risk', () => {
+test('missing and failed scans cannot be low risk', () => {
  for (const email of [{}, {scam_score:0,status:'failed'}, {scam_score:0,status:'fetched'}]) assert.equal(securitySummary(email).level, 'unknown');
 });
 test('completed analysis describes estimate, not a safety guarantee', () => {
