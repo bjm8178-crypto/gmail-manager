@@ -13,7 +13,7 @@ client = TestClient(app)
 
 
 @pytest.fixture
-def setup_test_model():
+def setup_test_model(isolated_postgres_db):
     """Insert a test model into ml_models table for testing."""
     import pickle
     import hashlib
@@ -232,7 +232,7 @@ def test_metadata_reflects_most_recent_active_model(setup_test_model):
         _release_connection(conn)
 
 
-def test_metadata_endpoint_response_structure():
+def test_metadata_endpoint_response_structure(setup_test_model):
     """Verify the complete response structure matches documentation."""
     conn = _get_connection()
     try:

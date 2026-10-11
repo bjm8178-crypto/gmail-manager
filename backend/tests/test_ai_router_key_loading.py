@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 
-BACKEND = Path(__file__).parent
+BACKEND = Path(__file__).resolve().parents[1]
 
 
 def test_scalar_gemini_key_is_loaded_into_rotation_pool():

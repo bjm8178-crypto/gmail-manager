@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = ROOT / "postgres_schema.sql"
 
 EXPECTED_TABLES = {

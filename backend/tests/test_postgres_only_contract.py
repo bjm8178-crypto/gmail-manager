@@ -2,7 +2,7 @@
 from pathlib import Path
 
 
-ROOT = Path(__file__).parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 DATABASE_SOURCE = (ROOT / "backend" / "database.py").read_text(encoding="utf-8")
 ROOT_EXAMPLE = (ROOT / ".env.example").read_text(encoding="utf-8")
 

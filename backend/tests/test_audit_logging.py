@@ -14,7 +14,7 @@ client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)
-def reset_audit_log():
+def reset_audit_log(isolated_postgres_db):
     """Clear audit_log table before each test."""
     conn = _get_connection()
     try:

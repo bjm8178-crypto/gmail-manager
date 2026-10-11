@@ -9,7 +9,7 @@ INDEX_NAME = "idx_retry_queue_retry_count_last_attempted_email_id"
 
 
 def test_retry_queue_migration_targets_existing_columns():
-    migration = Path(__file__).with_name("migrations") / "003_add_retry_queue_composite_index.sql"
+    migration = Path(__file__).resolve().parents[1] / "migrations" / "003_add_retry_queue_composite_index.sql"
     sql = migration.read_text(encoding="utf-8")
     index_sql = " ".join(line for line in sql.splitlines() if not line.strip().startswith("--"))
     assert INDEX_NAME in index_sql

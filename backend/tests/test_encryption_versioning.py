@@ -3,13 +3,14 @@ import importlib
 import pytest
 from cryptography.fernet import Fernet
 
+pytestmark = pytest.mark.usefixtures("isolated_postgres_db")
+
 
 def load_encryption(monkeypatch):
     key_v1 = Fernet.generate_key().decode()
     key_v2 = Fernet.generate_key().decode()
     monkeypatch.setenv("DB_ENCRYPTION_KEY", key_v1)
     monkeypatch.setenv("DB_ENCRYPTION_KEY_V2", key_v2)
-    monkeypatch.setenv("FORCE_SQLITE", "true")
     import encryption
     return importlib.reload(encryption), key_v1, key_v2
 
@@ -38,8 +39,6 @@ def test_unknown_or_corrupt_ciphertext_returns_none(monkeypatch):
 def test_rotate_encryption_keys_reencrypts_tokens(monkeypatch, tmp_path):
     encryption, key_v1, key_v2 = load_encryption(monkeypatch)
     import database
-    database = importlib.reload(database)
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "rotate.db")
     database.init_db()
     database._execute
     conn = database._get_connection()

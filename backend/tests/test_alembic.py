@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+import sys
 import uuid
 
 import database
@@ -18,11 +19,11 @@ def test_alembic_upgrade_creates_all_tables():
         env = os.environ.copy()
         env["ALEMBIC_SEARCH_PATH"] = schema
         result = subprocess.run(
-            ["python", "-m", "alembic", "-c", "alembic.ini", "upgrade", "head"],
+            [sys.executable, "-m", "alembic", "-c", "alembic.ini", "upgrade", "head"],
             capture_output=True,
             text=True,
             env=env,
-            cwd=os.path.dirname(__file__),
+            cwd=os.path.dirname(os.path.dirname(__file__)),
         )
         assert result.returncode == 0, f"Upgrade failed: {result.stderr}"
         database._execute(cursor, "SELECT count(*) AS n FROM information_schema.tables WHERE table_schema = %s", (schema,))
@@ -45,18 +46,18 @@ def test_alembic_downgrade_removes_application_tables():
         env = os.environ.copy()
         env["ALEMBIC_SEARCH_PATH"] = schema
         subprocess.run(
-            ["python", "-m", "alembic", "-c", "alembic.ini", "upgrade", "head"],
+            [sys.executable, "-m", "alembic", "-c", "alembic.ini", "upgrade", "head"],
             capture_output=True,
             env=env,
-            cwd=os.path.dirname(__file__),
+            cwd=os.path.dirname(os.path.dirname(__file__)),
             check=True,
         )
         result = subprocess.run(
-            ["python", "-m", "alembic", "-c", "alembic.ini", "downgrade", "base"],
+            [sys.executable, "-m", "alembic", "-c", "alembic.ini", "downgrade", "base"],
             capture_output=True,
             text=True,
             env=env,
-            cwd=os.path.dirname(__file__),
+            cwd=os.path.dirname(os.path.dirname(__file__)),
         )
         assert result.returncode == 0, f"Downgrade failed: {result.stderr}"
         database._execute(cursor, "SELECT count(*) AS n FROM information_schema.tables WHERE table_schema = %s", (schema,))

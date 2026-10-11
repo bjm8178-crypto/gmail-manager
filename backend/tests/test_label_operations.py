@@ -9,7 +9,7 @@ import database
 import main
 
 
-BACKEND_DIR = Path(__file__).parent
+BACKEND_DIR = Path(__file__).resolve().parents[1]
 
 
 def _find_unscoped_label_update_calls() -> list[tuple[str, int]]:

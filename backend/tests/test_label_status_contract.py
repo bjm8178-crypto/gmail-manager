@@ -2,7 +2,7 @@
 from pathlib import Path
 
 
-GMAIL_SOURCE = Path(__file__).with_name("gmail.py").read_text(encoding="utf-8")
+GMAIL_SOURCE = (Path(__file__).resolve().parents[1] / "gmail.py").read_text(encoding="utf-8")
 
 
 def test_label_pipeline_accepts_v2_complete_status():

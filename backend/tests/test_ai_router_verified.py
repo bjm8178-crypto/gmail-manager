@@ -209,8 +209,9 @@ async def test_call_groq_raises_provider_error_on_500():
 
 
 @pytest.mark.asyncio
-async def test_call_gemini_raises_quota_error_on_429():
+async def test_call_gemini_raises_quota_error_on_429(monkeypatch):
     """Test _call_gemini raises QuotaError when Gemini quota exceeded"""
+    monkeypatch.setattr("ai_router.GEMINI_API_KEYS", ["isolated-gemini-test-key"])
     from ai_router import AIRouter, QuotaError
     
     router = AIRouter()
@@ -225,8 +226,9 @@ async def test_call_gemini_raises_quota_error_on_429():
 
 
 @pytest.mark.asyncio
-async def test_call_cohere_raises_quota_error_on_429():
+async def test_call_cohere_raises_quota_error_on_429(monkeypatch):
     """Test _call_cohere raises QuotaError when Cohere rate limited"""
+    monkeypatch.setattr("ai_router.COHERE_API_KEY", "isolated-cohere-test-key")
     from ai_router import AIRouter, QuotaError
     
     router = AIRouter()

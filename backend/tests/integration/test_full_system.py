@@ -357,8 +357,8 @@ class TestDatabaseOperations:
             result = cursor.fetchone()
             assert result is not None, "users table should exist"
             
-            # Test emails table exists
-            cursor.execute("SELECT COUNT(*) as count FROM emails LIMIT 1")
+            # PostgreSQL persists email records in analyzed_emails.
+            cursor.execute("SELECT COUNT(*) as count FROM analyzed_emails LIMIT 1")
             result = cursor.fetchone()
             assert result is not None, "emails table should exist"
             

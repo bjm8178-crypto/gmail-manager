@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import database
 
 
-BACKEND_DIR = Path(__file__).parent
+BACKEND_DIR = Path(__file__).resolve().parents[1]
 
 
 def _find_unscoped_email_update_calls() -> list[tuple[str, int]]:

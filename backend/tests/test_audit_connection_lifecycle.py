@@ -4,7 +4,7 @@ import audit
 import database
 
 
-def test_repeated_audit_logging_releases_connections():
+def test_repeated_audit_logging_releases_connections(isolated_postgres_db):
     for _ in range(1000):
         audit.log_event(user_id=None, action="test.connection_lifecycle")
 

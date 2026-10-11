@@ -9,7 +9,7 @@ import ast
 from pathlib import Path
 
 
-DATABASE_SOURCE = Path(__file__).with_name("database.py")
+DATABASE_SOURCE = Path(__file__).resolve().parents[1] / "database.py"
 REQUIRED_ATTACHMENT_FIELDS = {"attachment_risk", "attachment_details"}
 
 

@@ -10,15 +10,21 @@ from pathlib import Path
 import pytest
 from unittest.mock import MagicMock, Mock, patch, AsyncMock
 
-BACKEND = Path(__file__).resolve().parent
+BACKEND = Path(__file__).resolve().parents[1]
 _modules = {name: MagicMock() for name in ("auth", "database", "ml_inference")}
 _spec = importlib.util.spec_from_file_location("gmail", BACKEND / "gmail.py")
 _gmail = importlib.util.module_from_spec(_spec)
 with patch.dict(sys.modules, _modules):
     _spec.loader.exec_module(_gmail)
-sys.modules["gmail"] = _gmail
+analyze_bulk_ordered = _gmail.analyze_bulk_ordered
+fetch_only_pipeline = _gmail.fetch_only_pipeline
 
-from gmail import analyze_bulk_ordered, fetch_only_pipeline
+
+@pytest.fixture(autouse=True)
+def isolated_gmail_module():
+    """Expose this module only while its own tests run, never during collection."""
+    with patch.dict(sys.modules, {"gmail": _gmail}):
+        yield
 
 
 @pytest.mark.anyio

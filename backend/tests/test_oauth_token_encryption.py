@@ -1,19 +1,18 @@
 import importlib
 import json
 
+import pytest
 from cryptography.fernet import Fernet
+
+pytestmark = pytest.mark.usefixtures("isolated_postgres_db")
 
 
 def setup_database(monkeypatch, tmp_path):
-    monkeypatch.setenv("FORCE_SQLITE", "true")
-    monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.setenv("DB_ENCRYPTION_KEY", Fernet.generate_key().decode())
     monkeypatch.setenv("DB_ENCRYPTION_KEY_V2", Fernet.generate_key().decode())
     import encryption
     importlib.reload(encryption)
     import database
-    database = importlib.reload(database)
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "oauth.db")
     database.init_db()
     conn = database._get_connection()
     try:

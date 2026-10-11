@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 import secrets
-import sqlite3
+import pytest
 import time
 import unittest
 from pathlib import Path
@@ -362,13 +362,16 @@ class OAuthTests(unittest.TestCase):
         self.assertEqual(request_kwargs['data']['code_verifier'], 'verifier-123')
 
 
+@pytest.mark.usefixtures("isolated_postgres_db")
 class StateTests(unittest.TestCase):
     def test_state_is_browser_bound_expiring_and_single_use(self):
         import sys
         from unittest.mock import patch
-        conn = sqlite3.connect(':memory:')
+        import database
+        conn = database._get_connection()
+        self.addCleanup(database._release_connection, conn)
         db = SimpleNamespace(_get_connection=lambda: conn, _release_connection=lambda c: None,
-                             _execute=lambda c, sql, args=(): c.execute(sql.replace('%s', '?'), args))
+                             _execute=database._execute)
         flow = SimpleNamespace(code_verifier='pkce-secret', authorization_url=lambda **kw: ('https://google.test', 'random-state'))
         env = dict(hashlib=hashlib, secrets=secrets, time=time, Flow=SimpleNamespace(from_client_config=lambda *a, **kw: flow),
                    CLIENT_CONFIG={}, SCOPES=[], REDIRECT_URI='https://test/callback', logger=Mock())
@@ -380,10 +383,9 @@ class StateTests(unittest.TestCase):
             self.assertEqual(env['consume_oauth_state']('random-state', session.copy()), 'pkce-secret')
             self.assertIsNone(env['consume_oauth_state']('random-state', session))
             env['get_auth_url'](session)
-            conn.execute('UPDATE oauth_login_states SET expires_at = 0')
+            conn.cursor().execute('UPDATE oauth_login_states SET expires_at = 0')
             conn.commit()
             self.assertIsNone(env['consume_oauth_state']('random-state', session))
-        conn.close()
 
 
 class EndpointTests(unittest.TestCase):
