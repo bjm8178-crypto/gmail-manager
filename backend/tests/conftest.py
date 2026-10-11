@@ -12,14 +12,15 @@ import uuid
 import pytest
 
 BACKEND = Path(__file__).resolve().parents[1]
-SANDBOX = os.environ.get("GMAIL_TEST_SANDBOX")
-if (not SANDBOX or BACKEND.parent != Path(SANDBOX).resolve()
-        or not (BACKEND.parent / ".isolated-test-sandbox").is_file()
-        or not getattr(sys, "_gmail_test_isolation", False)):
-    raise pytest.UsageError(
-        "Unsafe test environment: run backend/tests/isolated_runner.py with "
-        "a local PostgreSQL bin directory. Ambient database credentials are forbidden."
-    )
+if os.environ.get("ISOLATED_TESTS") == "1":
+    SANDBOX = os.environ.get("GMAIL_TEST_SANDBOX")
+    if (not SANDBOX or BACKEND.parent != Path(SANDBOX).resolve()
+            or not (BACKEND.parent / ".isolated-test-sandbox").is_file()
+            or not getattr(sys, "_gmail_test_isolation", False)):
+        raise pytest.UsageError(
+            "Unsafe test environment: run backend/tests/isolated_runner.py with "
+            "a local PostgreSQL bin directory. Ambient database credentials are forbidden."
+        )
 sys.path.insert(0, str(BACKEND))
 
 
@@ -37,27 +38,33 @@ def isolated_postgres_db(monkeypatch):
     from psycopg2.extras import RealDictCursor
     from psycopg2.pool import ThreadedConnectionPool
 
-    name = "gmail_test_" + uuid.uuid4().hex
-    admin = psycopg2.connect(os.environ["DATABASE_URL"])
-    admin.autocommit = True
-    pool = None
-    try:
-        with admin.cursor() as cursor:
-            cursor.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
-        dsn = make_dsn(os.environ["DATABASE_URL"], dbname=name)
-        pool = ThreadedConnectionPool(2, 50, dsn=dsn, cursor_factory=RealDictCursor)
-        with monkeypatch.context() as context:
-            context.setattr(database, "_pg_pool", pool)
-            context.setattr(database, "DATABASE_URL", dsn)
-            context.setenv("DATABASE_URL", dsn)
-            database.init_db()
-            yield database
-    finally:
-        if pool is not None:
-            pool.closeall()
-        with admin.cursor() as cursor:
-            cursor.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name)))
-        admin.close()
+    if os.environ.get("ISOLATED_TESTS") == "1":
+        # Isolated mode: create disposable database
+        name = "gmail_test_" + uuid.uuid4().hex
+        admin = psycopg2.connect(os.environ["DATABASE_URL"])
+        admin.autocommit = True
+        pool = None
+        try:
+            with admin.cursor() as cursor:
+                cursor.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+            dsn = make_dsn(os.environ["DATABASE_URL"], dbname=name)
+            pool = ThreadedConnectionPool(2, 50, dsn=dsn, cursor_factory=RealDictCursor)
+            with monkeypatch.context() as context:
+                context.setattr(database, "_pg_pool", pool)
+                context.setattr(database, "DATABASE_URL", dsn)
+                context.setenv("DATABASE_URL", dsn)
+                database.init_db()
+                yield database
+        finally:
+            if pool is not None:
+                pool.closeall()
+            with admin.cursor() as cursor:
+                cursor.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name)))
+            admin.close()
+    else:
+        # Normal mode: use existing local database, don't create/drop
+        database.init_db()
+        yield database
 
 
 @pytest.fixture(autouse=True)

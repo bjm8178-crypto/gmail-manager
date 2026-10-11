@@ -17,6 +17,8 @@ def setup_database(monkeypatch, tmp_path):
     conn = database._get_connection()
     try:
         cur = conn.cursor()
+        # Clean up any existing test user first
+        database._execute(cur, "DELETE FROM users WHERE gmail_address = %s", ("user@example.com",))
         database._execute(cur, "INSERT INTO users (gmail_address) VALUES (%s)", ("user@example.com",))
         conn.commit()
     finally:

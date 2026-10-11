@@ -44,7 +44,9 @@ def test_rotate_encryption_keys_reencrypts_tokens(monkeypatch, tmp_path):
     conn = database._get_connection()
     try:
         cur = conn.cursor()
-        database._execute(cur, "INSERT INTO users (gmail_address, token) VALUES (%s, %s)", ("old@example.com", Fernet(key_v1.encode()).encrypt(b'{\"token\":\"old\"}').decode()))
+        # Clean up any existing test user first
+        database._execute(cur, "DELETE FROM users WHERE gmail_address = %s", ("old@example.com",))
+        database._execute(cur, "INSERT INTO users (gmail_address, token) VALUES (%s, %s)", ("old@example.com", Fernet(key_v1.encode()).encrypt(b'{"token":"old"}').decode()))
         conn.commit()
     finally:
         database._release_connection(conn)

@@ -84,6 +84,7 @@ def main():
         pg("createdb", "-h", "127.0.0.1", "-p", port, "-U", "gmail_hygiene_admin",
            "-O", "gmail_test_runner", "gmail_test_suite")
         env.update({
+            "ISOLATED_TESTS": "1",
             "GMAIL_TEST_SANDBOX": str(source), "GMAIL_TEST_PG_PORT": str(port),
             "PYTHONPATH": str(backend), "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
             "DATABASE_URL": f"postgresql://gmail_test_runner@127.0.0.1:{port}/gmail_test_suite",
@@ -110,6 +111,13 @@ def main():
         result["pytest_exit"] = completed.returncode
         print("PYTEST_EXIT:", completed.returncode, flush=True)
         print("PYTEST_LOG:", run / "pytest.log", flush=True)
+        # Print last 40 lines of pytest output for verification
+        log_path = run / "pytest.log"
+        if log_path.exists():
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            print("\n=== LAST 40 LINES OF PYTEST OUTPUT ===", flush=True)
+            for line in lines[-40:]:
+                print(line, flush=True)
         return completed.returncode
     finally:
         if started:

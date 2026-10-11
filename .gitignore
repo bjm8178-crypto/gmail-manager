@@ -59,6 +59,7 @@ logs/*.log.*
 
 # Coverage reports
 htmlcov/
+coverage.json
 .coverage
 *.coverage
 
