@@ -63,8 +63,8 @@ async def route_email_with_v2(
                 raise ValueError('Invalid phishing probability')
             score = float(candidate)
             response['v2_score'] = score
-        except Exception:
-            logger.warning('[V2_ROUTER] Local prediction failed')
+        except Exception as e:
+            logger.warning('[V2_ROUTER] Local prediction failed: %s: %s', type(e).__name__, str(e)[:200])
 
     try:
         ai_result = await ai_cascade_func()
