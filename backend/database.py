@@ -32,35 +32,45 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required; PostgreSQL-only mode refuses to start without it")
 USE_POSTGRES = True
 
+# Phase 1 Task 1: Configurable pool size with safe defaults for Supabase
+# Supabase session pooler cap is 15 connections; default to 8 to leave headroom
+# For transaction pooler (port 6543), increase DB_POOL_MAX as needed
+DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "2"))
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "8"))
+
 if USE_POSTGRES:
     import psycopg2
     from psycopg2 import pool as psycopg2_pool
     from psycopg2.extras import RealDictCursor
     _pg_pool = psycopg2_pool.ThreadedConnectionPool(
-        minconn=2, maxconn=50, dsn=DATABASE_URL,
+        minconn=DB_POOL_MIN, maxconn=DB_POOL_MAX, dsn=DATABASE_URL,
         cursor_factory=RealDictCursor
     )
-    logger.info("[DB] Using Postgres (DATABASE_URL detected) with connection pool (2-50 connections)")
+    logger.info(f"[DB] Using Postgres (DATABASE_URL detected) with connection pool ({DB_POOL_MIN}-{DB_POOL_MAX} connections)")
 _PLACEHOLDER = "%s"
 
 
 def _get_connection():
     """
-    Get a database connection (from pool for Postgres, fresh for SQLite).
+    Get a database connection (from pool for Postgres).
     Returns a connection with dict-like row access.
+    Phase 1 Task 1: Short bounded wait+retry on pool exhaustion instead of immediate fail.
     """
     global _PLACEHOLDER
     if USE_POSTGRES:
-        # Postgres connection from pool
+        # Postgres connection from pool with exponential backoff
         for attempt in range(5):
             try:
                 conn = _pg_pool.getconn()
                 _PLACEHOLDER = "%s"
                 return conn
-            except psycopg2_pool.PoolError:
+            except psycopg2_pool.PoolError as e:
                 if attempt == 4:
+                    logger.error(f"[DB] Pool exhausted after 5 attempts. Consider increasing DB_POOL_MAX (current: {DB_POOL_MAX}) or switching to Supabase transaction pooler (port 6543).")
                     raise
-                time.sleep(0.1 * (2 ** attempt))
+                wait_time = 0.1 * (2 ** attempt)
+                logger.warning(f"[DB] Pool exhausted (attempt {attempt + 1}/5), retrying in {wait_time:.2f}s...")
+                time.sleep(wait_time)
     else:
         # PostgreSQL required; SQLite fallback removed
         raise RuntimeError(
