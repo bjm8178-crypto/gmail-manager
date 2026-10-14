@@ -570,7 +570,7 @@ class AIRouter:
 
     async def _call_groq(self, prompt: str) -> str:
         """
-        Call Groq API with llama-3.1-8b-instant model, rotating through 9 API keys.
+        Call Groq API with openai/gpt-oss-20b model, rotating through 9 API keys.
         Primary AI provider. Called first in the cascade.
         
         Tries all available Groq API keys in round-robin order before raising QuotaError.
