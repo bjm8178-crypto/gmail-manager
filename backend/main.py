@@ -5,6 +5,7 @@ security scanning, scam alerts, and email rewriting.
 Uses SessionMiddleware to store user_id and gmail_address after login.
 """
 
+import asyncio
 import os
 import sys
 import json
@@ -78,6 +79,22 @@ from schemas import (
 
 # ---------- APP INITIALIZATION ----------
 
+
+async def _monitor_event_loop_lag():
+    """Temporarily report event-loop stalls during production diagnosis."""
+    loop = asyncio.get_running_loop()
+    while True:
+        started = loop.time()
+        await asyncio.sleep(0.1)
+        elapsed = loop.time() - started
+        if elapsed > 0.3:
+            logger.warning(
+                "[EVENT_LOOP_LAG] 100ms sleep took %.0fms (lag %.0fms)",
+                elapsed * 1000,
+                (elapsed - 0.1) * 1000,
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -88,7 +105,6 @@ async def lifespan(app: FastAPI):
     logger.info("[STARTUP] BEGIN - Railway deployment 2026-08-20T04:05Z")
     
     # Set explicit thread pool size for asyncio.to_thread() to prevent exhaustion
-    import asyncio
     from concurrent.futures import ThreadPoolExecutor
     loop = asyncio.get_running_loop()
     loop.set_default_executor(ThreadPoolExecutor(max_workers=32))
@@ -132,9 +148,16 @@ async def lifespan(app: FastAPI):
         logger.warning(f"[STARTUP] Index application skipped: {e}")
     
     logger.info("[STARTUP] COMPLETE - Gmail Manager API ready on port 8000")
-    
+    lag_monitor_task = asyncio.create_task(_monitor_event_loop_lag())
+
     yield
-    
+
+    lag_monitor_task.cancel()
+    try:
+        await lag_monitor_task
+    except asyncio.CancelledError:
+        pass
+
     # ---------- SHUTDOWN ----------
     logger.info("[SHUTDOWN] BEGIN - Shutting down Gmail Manager API")
     
