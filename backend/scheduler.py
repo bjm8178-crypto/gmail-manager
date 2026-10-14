@@ -55,14 +55,26 @@ def _get_retry_user_ids() -> list[int]:
 def _run_retry_pipeline(user_id: int, user_email: str, email_ids: list[str]) -> None:
     """Consume the real async retry pipeline for one owned user's IDs."""
     from gmail import label_only_pipeline
+    from job_lock import acquire_user_job_lock, release_user_job_lock, clear_user_inflight_emails
 
     async def consume_pipeline() -> None:
-        async for _event in label_only_pipeline(
-            user_id=user_id,
-            user_email=user_email,
-            email_ids=email_ids,
-        ):
-            pass
+        # Phase 1 Task 2: Protect scheduler retry with same job lock
+        job_lock = await acquire_user_job_lock(user_id, timeout=0.1)
+        if not job_lock:
+            logger.warning(f"[SCHEDULER] Skipping retry for user_id={user_id} (job already running)")
+            return
+        
+        try:
+            async for _event in label_only_pipeline(
+                user_id=user_id,
+                user_email=user_email,
+                email_ids=email_ids,
+            ):
+                pass
+        finally:
+            # Phase 1 Task 2: Always release lock and clear in-flight tracking
+            release_user_job_lock(job_lock)
+            clear_user_inflight_emails(user_id)
 
     asyncio.run(consume_pipeline())
 
