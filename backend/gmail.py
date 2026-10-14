@@ -27,20 +27,35 @@ from database import (
 )
 from ml_inference import predict_async, is_model_available, log_disagreement
 
+# Phase 1 Task 4: Thread-local Gmail service cache (build once per run)
+import threading
+_service_cache = threading.local()
+
 
 def get_gmail_service(user_email: str = None):
     """
     Build and return a Gmail API service instance for a specific user.
     Uses the DB-stored OAuth credentials for that user (keyed by gmail_address).
     Returns None if the user is not authenticated.
+    
+    Phase 1 Task 4: Cached per thread — httplib2 transports cannot be shared across threads.
     """
+    # Check thread-local cache first
+    cache_key = f"service_{user_email}"
+    if hasattr(_service_cache, cache_key):
+        logger.debug(f"[GMAIL] Reusing cached service for {user_email}")
+        return getattr(_service_cache, cache_key)
+    
     creds = get_credentials(user_email)
     if not creds:
         logger.info("[GMAIL] No valid credentials found. User needs to log in.")
         return None
 
     service = build("gmail", "v1", credentials=creds)
-    logger.info("[GMAIL] Gmail service initialized.")
+    logger.info(f"[GMAIL] Gmail service initialized for {user_email}")
+    
+    # Cache for this thread
+    setattr(_service_cache, cache_key, service)
     return service
 
 
@@ -1029,7 +1044,8 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                 await persist(label_id=None, scam_score=None, scam_indicators="[]", is_quarantined=0,
                         status="fetched", received_at=received_at, analysis_status="pending")
 
-            urls = list(dict.fromkeys(extract_urls(body)))
+            # Phase 1 Task 4: Offload HTML parsing (BeautifulSoup) to thread pool
+            urls = list(dict.fromkeys(await asyncio.to_thread(extract_urls, body)))
             urls_total = len(urls)
             selected_urls = urls[:MAX_URLS_SCANNED]
             scan_results = await asyncio.gather(*[
