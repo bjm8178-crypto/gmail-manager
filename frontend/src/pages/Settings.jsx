@@ -19,7 +19,7 @@ const API_FIELDS = [
     key: 'GROQ_API_KEY',
     label: 'Groq API Key',
     placeholder: 'gsk_...',
-    description: 'Primary AI provider — Groq LLaMA 3',
+    description: 'Primary AI provider — Groq (gpt-oss-20b)',
     role: 'Primary',
     icon: '🟢',
   },
@@ -27,7 +27,7 @@ const API_FIELDS = [
     key: 'GEMINI_API_KEY',
     label: 'Gemini API Key',
     placeholder: 'AIzaSy...',
-    description: 'Secondary AI provider — Google Gemini Flash',
+    description: 'Secondary AI provider — Google Gemini 3.5 Flash-Lite',
     role: 'Secondary',
     icon: '🔵',
   },
@@ -40,12 +40,12 @@ const API_FIELDS = [
     icon: '🟡',
   },
   {
-    key: 'NVIDIA_API_KEY',
-    label: 'NVIDIA API Key',
-    placeholder: 'nvapi-...',
-    description: 'Reserved provider (inactive, future use)',
-    role: 'Inactive',
-    icon: '⚪',
+    key: 'CLOUDFLARE_API_TOKEN',
+    label: 'Cloudflare Workers AI',
+    placeholder: 'cfut_...',
+    description: 'Quaternary AI provider — GLM-4.7-Flash',
+    role: 'Quaternary',
+    icon: '🟠',
   },
   {
     key: 'GOOGLE_SAFE_BROWSING_KEY',
@@ -221,7 +221,7 @@ function Settings() {
 
   function isConfigured(providerKey) {
     const keyMap = {
-      'NVIDIA_API_KEY': 'nvidia',
+      'CLOUDFLARE_API_TOKEN': 'cloudflare',
       'GEMINI_API_KEY': 'gemini',
       'COHERE_API_KEY': 'cohere',
       'GROQ_API_KEY': 'groq',
@@ -331,7 +331,7 @@ function Settings() {
 
           <div className="mt-4 p-3 rounded-lg" style={{ background: 'var(--info-bg)', border: '1px solid var(--info-border)' }}>
             <p className="text-xs text-info">
-              ℹ️ API keys are stored securely in your Railway environment variables and never exposed to the frontend.
+              ℹ️ API keys are stored securely in backend environment variables and never exposed to the frontend.
             </p>
           </div>
         </section>

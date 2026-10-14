@@ -29,6 +29,8 @@ export function AnalysisProvider({ children }) {
   const [stats, setStats] = useState(null);
   const [currentEmail, setCurrentEmail] = useState('');
 
+  const [error, setError] = useState(null);
+
   // Store the reader ref so the SSE stream survives re-renders
   const readerRef = useRef(null);
   const abortRef = useRef(null);
@@ -54,6 +56,7 @@ export function AnalysisProvider({ children }) {
     setTotal(0);
     setResults([]);
     setStats(null);
+    setError(null);
     setCurrentEmail('');
 
     const controller = new AbortController();
@@ -68,8 +71,8 @@ export function AnalysisProvider({ children }) {
       });
 
       if (!fetchResponse.ok) {
-        const errorData = await fetchResponse.json();
-        throw new Error(errorData.error || 'Failed to fetch emails');
+        const errorData = await fetchResponse.json().catch(() => ({}));
+        throw new Error(errorData.message || errorData.error || 'Failed to fetch emails');
       }
 
       const fetchData = await fetchResponse.json();
@@ -83,29 +86,28 @@ export function AnalysisProvider({ children }) {
       });
 
       if (!labelResponse.ok) {
-        const errorData = await labelResponse.json();
-        throw new Error(errorData.error || 'Failed to analyze emails');
+        const errorData = await labelResponse.json().catch(() => ({}));
+        throw new Error(errorData.message || errorData.error || 'Failed to analyze emails');
       }
 
       const labelData = await labelResponse.json();
 
-      if (labelData.analyzed > 0 || labelData.failed > 0) {
-        setIsInitializing(false);
-        setStats({
-          analyzed: labelData.analyzed || 0,
-          skipped: labelData.skipped || 0,
-          failed: labelData.failed || 0,
-          retried: 0,
-        });
-        setResults(labelData.results || []);
-        setProgress(labelData.analyzed || 0);
-        setTotal(labelData.analyzed || 0);
-        setCurrentEmail('Analysis complete');
-      }
+      setIsInitializing(false);
+      setStats({
+        analyzed: labelData.analyzed || 0,
+        skipped: labelData.skipped || 0,
+        failed: labelData.failed || 0,
+        retried: 0,
+      });
+      setResults(labelData.results || []);
+      setProgress(labelData.analyzed || 0);
+      setTotal(labelData.analyzed || 0);
+      setCurrentEmail('Analysis complete');
     } catch (err) {
       if (err.name !== 'AbortError') {
         console.error('[AnalysisContext] Analysis error:', err);
         setCurrentEmail('Analysis failed');
+        setError(err.message || 'Analysis failed');
       }
     } finally {
       setIsAnalyzing(false);
@@ -120,6 +122,10 @@ export function AnalysisProvider({ children }) {
     setStats(null);
   }, []);
 
+  const clearError = useCallback(() => {
+    setError(null);
+  }, []);
+
   const value = {
     isAnalyzing,
     isInitializing,
@@ -127,9 +133,11 @@ export function AnalysisProvider({ children }) {
     total,
     results,
     stats,
+    error,
     currentEmail,
     startAnalysis,
     clearStats,
+    clearError,
   };
 
   return (

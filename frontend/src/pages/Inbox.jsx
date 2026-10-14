@@ -29,7 +29,7 @@ const LIMIT_OPTIONS = [25, 50, 100];
 function Inbox() {
   const navigate = useNavigate();
   const toast = useToast();
-  const { isAnalyzing, isInitializing, progress, total, stats, currentEmail, startAnalysis, clearStats } = useAnalysis();
+  const { isAnalyzing, isInitializing, progress, total, stats, currentEmail, startAnalysis, clearStats, error: analysisError, clearError } = useAnalysis();
 
   // Email data
   const [emails, setEmails] = useState([]);
@@ -106,10 +106,17 @@ function Inbox() {
   // Refresh email list when analysis completes — fires exactly once per run
   useEffect(() => {
     if (stats && !isAnalyzing) {
-      toast.success(
-        `Analysis complete!`,
-        `${stats.analyzed} analyzed, ${stats.failed || 0} failed`
-      );
+      if (stats.analyzed > 0 || stats.failed > 0) {
+        toast.success(
+          `Analysis complete!`,
+          `${stats.analyzed} analyzed, ${stats.failed || 0} failed`
+        );
+      } else {
+        toast.info(
+          'Inbox up to date',
+          'No new unanalyzed emails found.'
+        );
+      }
       // Use refs so we always read current filter state, not stale closure values
       fetchFilteredEmails(searchQueryRef.current, labelFilterRef.current, sortByRef.current);
       fetchStats();
@@ -118,6 +125,14 @@ function Inbox() {
       clearStats();
     }
   }, [stats, isAnalyzing, clearStats]);
+
+  // Surface analysis errors to the user
+  useEffect(() => {
+    if (analysisError && !isAnalyzing) {
+      toast.error('Analysis failed', analysisError);
+      if (clearError) clearError();
+    }
+  }, [analysisError, isAnalyzing, clearError]);
 
   async function verifyAndFetch() {
     try {
