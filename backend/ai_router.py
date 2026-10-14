@@ -152,9 +152,12 @@ AI_PROVIDER_TIMEOUT = float(os.getenv("AI_PROVIDER_TIMEOUT", "12"))
 AI_DEADLINE = float(os.getenv("AI_DEADLINE", "30"))
 
 # Circuit-breaker cooldown bounds (seconds).
+# AI_BREAKER_* bound the DEFAULT window used when a provider gives no Retry-After hint.
+# An explicit Retry-After is honoured as-is up to AI_BREAKER_MAX_RETRY_AFTER (5min default).
 AI_BREAKER_COOLDOWN = float(os.getenv("AI_BREAKER_COOLDOWN", "45"))
 AI_BREAKER_MIN_COOLDOWN = float(os.getenv("AI_BREAKER_MIN_COOLDOWN", "30"))
 AI_BREAKER_MAX_COOLDOWN = float(os.getenv("AI_BREAKER_MAX_COOLDOWN", "60"))
+AI_BREAKER_MAX_RETRY_AFTER = float(os.getenv("AI_BREAKER_MAX_RETRY_AFTER", "300"))
 
 # Email-analysis concurrency (replaces the hard-coded Semaphore(2)).
 ANALYZE_CONCURRENCY = max(1, int(os.getenv("ANALYZE_CONCURRENCY", "3")))
@@ -347,9 +350,9 @@ class _ProviderBreaker:
         async with self._lock:
             self._probe_in_flight.discard(name)
             if retry_after is not None:
-                # Task 6: honour the provider's Retry-After (small floor to avoid
-                # thrash, capped so one provider cannot stall the run forever).
-                cooldown = min(AI_BREAKER_MAX_COOLDOWN, max(1.0, retry_after))
+                # Task 6: honour the provider's Retry-After as-is (1s floor to prevent
+                # hot loops; generous 5min ceiling only to stop pathological values).
+                cooldown = min(AI_BREAKER_MAX_RETRY_AFTER, max(1.0, retry_after))
             else:
                 # Task 7: no hint -> default 30-60s window.
                 cooldown = max(AI_BREAKER_MIN_COOLDOWN,
@@ -679,6 +682,9 @@ class AIRouter:
 
         last_quota_error = None
         last_retry_after = None
+        last_transient_error = None
+        quota_errors = 0
+        transient_errors = 0
         for offset in range(len(GEMINI_API_KEYS)):
             key = GEMINI_API_KEYS[(start_index + offset) % len(GEMINI_API_KEYS)]
 
@@ -699,7 +705,9 @@ class AIRouter:
             }
 
             try:
-                response = await self.async_client.post(url, json=body, headers=headers, timeout=30.0)
+                response = await self.async_client.post(
+                    url, json=body, headers=headers, timeout=AI_PROVIDER_TIMEOUT
+                )
 
                 if response.status_code == 429:
                     retry_after = response.headers.get("Retry-After")
@@ -712,17 +720,28 @@ class AIRouter:
                                     break
                         except Exception:
                             pass
+                    quota_errors += 1
                     last_quota_error = (
                         f"Gemini quota exceeded: {response.text[:300]} | "
                         f"retry-after={retry_after}"
                     )
                     last_retry_after = _parse_retry_after(response)
-                    continue
+                    continue  # rotate to the next key
+
+                # Task 5: rotate ALL keys on 429/503 (not just 429).
+                if response.status_code >= 500 or response.status_code == 408:
+                    transient_errors += 1
+                    last_transient_error = (
+                        f"Gemini error {response.status_code}: {response.text[:200]}"
+                    )
+                    last_retry_after = _parse_retry_after(response) or last_retry_after
+                    continue  # rotate to the next key
 
                 if response.status_code != 200:
+                    # Non-retryable (auth/bad request): rotating keys will not help.
                     raise ProviderError(
                         f"Gemini error {response.status_code}: {response.text[:200]}",
-                        transient=response.status_code >= 500 or response.status_code == 408,
+                        transient=False,
                         retry_after=_parse_retry_after(response),
                     )
 
@@ -735,7 +754,20 @@ class AIRouter:
                     f"Gemini request timed out ({AI_PROVIDER_TIMEOUT:.0f}s)", transient=True
                 )
 
-        raise QuotaError(last_quota_error or "All Gemini API keys exhausted (quota)", last_retry_after)
+        # All keys tried: report the most actionable failure.
+        if quota_errors:
+            raise QuotaError(
+                last_quota_error or f"All {len(GEMINI_API_KEYS)} Gemini keys exhausted (quota)",
+                last_retry_after,
+            )
+        if transient_errors:
+            raise ProviderError(
+                last_transient_error
+                or f"All {len(GEMINI_API_KEYS)} Gemini keys failed (transient)",
+                transient=True,
+                retry_after=last_retry_after,
+            )
+        raise ProviderError(f"All {len(GEMINI_API_KEYS)} Gemini keys failed")
 
     # ---------- PROVIDER: COHERE (TERTIARY) ----------
 
