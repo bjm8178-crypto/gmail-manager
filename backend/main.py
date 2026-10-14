@@ -1481,9 +1481,15 @@ async def reanalyze_scam_email(
     elif ai_result.get("error"):
         return JSONResponse(status_code=503, content={"error": ai_result["error"]})
 
-    # Validate label
-    if label not in available_label_names:
-        label = default_label
+    # Phase 2 Task 9: fuzzy/case-insensitive label match, then one label-only retry.
+    from ai_router import match_label
+    matched_label = match_label(label, available_label_names)
+    if matched_label is None and isinstance(scam_score, (int, float)) and not isinstance(scam_score, bool):
+        try:
+            matched_label = await ai_router.label_only(sender, subject, body, available_label_names)
+        except Exception as label_error:
+            logger.info(f"[SCAM REANALYZE] Label-only retry failed for {email_id[:12]}: {label_error}")
+    label = matched_label or default_label
 
     # Validate scam_score (0-100)
     if not isinstance(scam_score, int):

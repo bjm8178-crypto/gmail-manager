@@ -190,6 +190,11 @@ def test_root_env_example_contains_placeholders_for_secret_fields():
 
 
 def test_provider_cascade_reaches_last_resort_methods(monkeypatch):
+    """Phase 2 Task 5: cascade follows the configured order and falls through.
+
+    Only providers configured at startup are attempted (no retired NVIDIA, no
+    keyless Kilo/LLM7 unless opted in); the last configured provider answers.
+    """
     import asyncio
     import ai_router
 
@@ -200,11 +205,112 @@ def test_provider_cascade_reaches_last_resort_methods(monkeypatch):
         attempted.append(name)
         raise ai_router.ProviderError(f"{name} unavailable")
 
-    for name in ("groq", "nvidia", "gemini", "cohere", "openrouter", "cloudflare", "mistral", "zai", "llm7", "kilo"):
+    order = ["groq", "gemini", "cohere", "openrouter", "ovh"]
+    for name in order[:-1]:
         monkeypatch.setattr(router, f"_call_{name}", lambda prompt, provider=name: fail(provider))
     monkeypatch.setattr(router, "_call_ovh", lambda prompt: asyncio.sleep(0, result="fallback"))
+
+    router._configured = order
+    router._provider_registry = {name: getattr(router, f"_call_{name}") for name in order}
 
     result = asyncio.run(router.analyze("prompt"))
 
     assert result == {"response": "fallback", "provider_used": "OVH"}
-    assert attempted == ["groq", "nvidia", "gemini", "cohere", "openrouter", "cloudflare", "mistral", "zai", "llm7", "kilo"]
+    assert attempted == ["groq", "gemini", "cohere", "openrouter"]
+
+
+def test_provider_order_is_env_driven_and_skips_unconfigured(monkeypatch):
+    """Phase 2 Task 5: AI_PROVIDER_ORDER sets order; unconfigured providers are dropped."""
+    import ai_router
+
+    monkeypatch.setattr(ai_router, "AI_PROVIDER_ORDER", ["ovh", "groq", "nvidia", "kilo"])
+    monkeypatch.setattr(ai_router, "GROQ_API_KEYS", [])
+    monkeypatch.setattr(ai_router, "NVIDIA_API_KEY", "set")
+    monkeypatch.setattr(ai_router, "NVIDIA_MODEL", None)  # retired default stays disabled
+    monkeypatch.setattr(ai_router, "ENABLE_KILO", False)
+
+    router = ai_router.AIRouter.__new__(ai_router.AIRouter)
+    router._provider_registry = {"groq": None, "nvidia": None, "kilo": None, "ovh": None}
+
+    assert router._resolve_configured_providers() == ["ovh"]
+
+
+def test_match_label_handles_case_and_fuzzy_variants():
+    """Phase 2 Task 9: case-insensitive and fuzzy label resolution."""
+    from ai_router import match_label
+
+    labels = ["Inbox", "Promotions", "Spam"]
+    assert match_label("spam", labels) == "Spam"
+    assert match_label("PROMOTIONS", labels) == "Promotions"
+    assert match_label("Spam ", labels) == "Spam"
+    assert match_label("banana", labels) is None
+    assert match_label(None, labels) is None
+    assert match_label("Spam", []) is None
+
+
+def test_breaker_skips_provider_during_cooldown():
+    """Phase 2 Task 7: a failed provider is skipped for the cooldown, then half-opens."""
+    import asyncio
+    import ai_router
+
+    breaker = ai_router._ProviderBreaker()
+
+    async def run():
+        assert await breaker.is_available("Groq") is True
+        await breaker.record_failure("Groq", retry_after=1)
+        assert await breaker.is_available("Groq") is False
+        assert "Groq" in breaker.snapshot()
+        await asyncio.sleep(1.05)
+        # Half-open: one probe admitted, a second concurrent probe is not.
+        assert await breaker.is_available("Groq") is True
+        assert await breaker.is_available("Groq") is False
+        await breaker.record_success("Groq")
+        assert await breaker.is_available("Groq") is True
+        assert breaker.snapshot() == {}
+
+    asyncio.run(run())
+
+
+def test_analyze_uses_shared_breaker_across_calls():
+    """Phase 2 Task 7: breaker state is process-wide, so a cooling provider is skipped later."""
+    import asyncio
+    import ai_router
+
+    router = ai_router.AIRouter.__new__(ai_router.AIRouter)
+    calls = {"groq": 0}
+
+    async def groq_fail(prompt):
+        calls["groq"] += 1
+        raise ai_router.QuotaError("rate limited", retry_after=60)
+
+    async def ovh_ok(prompt):
+        return "ok"
+
+    router._configured = ["groq", "ovh"]
+    router._provider_registry = {"groq": groq_fail, "ovh": ovh_ok}
+
+    async def run():
+        first = await router.analyze("p")
+        second = await router.analyze("p")
+        return first, second, calls["groq"]
+
+    first, second, groq_calls = asyncio.run(run())
+    assert first["provider_used"] == "OVH"
+    assert second["provider_used"] == "OVH"
+    assert groq_calls == 1  # second cascade skipped the open circuit
+
+
+def test_label_only_returns_canonical_label(monkeypatch):
+    """Phase 2 Task 9: the one-shot label call resolves to a real label."""
+    import asyncio
+    import ai_router
+
+    router = ai_router.AIRouter.__new__(ai_router.AIRouter)
+
+    async def fake(prompt, parse_json=True):
+        return {"data": {"label": "spam"}, "provider_used": "Groq"}
+
+    monkeypatch.setattr(router, "_run_cascade", fake)
+
+    assert asyncio.run(router.label_only("s@x.com", "subj", "body", ["Inbox", "Spam"])) == "Spam"
+    assert asyncio.run(router.label_only("s@x.com", "subj", "body", [])) is None

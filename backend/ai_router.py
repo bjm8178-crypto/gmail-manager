@@ -12,12 +12,16 @@ from logger_setup import get_logger
 logger = get_logger(__name__)
 
 import os
+import re
 import json
 import asyncio
 import time
+import difflib
 import httpx
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+from typing import Callable
 from collections import deque
 from dotenv import load_dotenv
 
@@ -77,8 +81,9 @@ def _load_key_pool(prefix: str, numbered_count: int) -> list[str]:
 GROQ_API_KEYS = _load_key_pool("GROQ_API_KEY", 9)
 GROQ_API_KEY = GROQ_API_KEYS[0] if GROQ_API_KEYS else None
 
-# NVIDIA API (secondary fallback - fast model)
+# NVIDIA API — disabled unless NVIDIA_MODEL is set (the previous default model is retired)
 NVIDIA_API_KEY = _usable_secret(os.getenv("NVIDIA_API_KEY"))
+NVIDIA_MODEL = _usable_secret(os.getenv("NVIDIA_MODEL"))
 
 # Gemini API (secondary) - scalar key followed by 17 rotating keys
 GEMINI_API_KEYS = _load_key_pool("GEMINI_API_KEY", 17)
@@ -96,8 +101,9 @@ def get_provider_status() -> dict[str, dict[str, bool | int]]:
         "cloudflare": {"configured": bool(CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN)},
         "mistral": {"configured": bool(MISTRAL_API_KEY)},
         "zai": {"configured": bool(ZAI_API_KEY)},
-        "llm7": {"configured": bool(LLM7_API_KEY)},
-        "kilo": {"configured": True},
+        "llm7": {"configured": ENABLE_LLM7},
+        "kilo": {"configured": ENABLE_KILO},
+        "breaker_open": AI_BREAKER.snapshot(),
         "ovh": {"configured": True},
         "safebrowsing": {"configured": bool(GOOGLE_SAFE_BROWSING_KEY)},
     }
@@ -129,11 +135,42 @@ LLM7_API_KEY = _usable_secret(os.getenv("LLM7_API_KEY"))
 GOOGLE_SAFE_BROWSING_KEY = _usable_secret(os.getenv("GOOGLE_SAFE_BROWSING_KEY"))
 
 
+# ---------- PHASE 2: CASCADE CONFIGURATION ----------
+
+# Provider order is env-driven. Default: Groq -> Gemini -> Cohere -> OVH.
+_DEFAULT_PROVIDER_ORDER = "groq,gemini,cohere,ovh"
+AI_PROVIDER_ORDER = [
+    name.strip().lower()
+    for name in os.getenv("AI_PROVIDER_ORDER", _DEFAULT_PROVIDER_ORDER).split(",")
+    if name.strip()
+]
+
+# Per-provider request timeout (seconds). Replaces the old 30-45s default.
+AI_PROVIDER_TIMEOUT = float(os.getenv("AI_PROVIDER_TIMEOUT", "12"))
+
+# Overall per-email AI deadline (seconds) across the entire cascade.
+AI_DEADLINE = float(os.getenv("AI_DEADLINE", "30"))
+
+# Circuit-breaker cooldown bounds (seconds).
+AI_BREAKER_COOLDOWN = float(os.getenv("AI_BREAKER_COOLDOWN", "45"))
+AI_BREAKER_MIN_COOLDOWN = float(os.getenv("AI_BREAKER_MIN_COOLDOWN", "30"))
+AI_BREAKER_MAX_COOLDOWN = float(os.getenv("AI_BREAKER_MAX_COOLDOWN", "60"))
+
+# Email-analysis concurrency (replaces the hard-coded Semaphore(2)).
+ANALYZE_CONCURRENCY = max(1, int(os.getenv("ANALYZE_CONCURRENCY", "3")))
+
+# Keyless providers are opt-in: Kilo returns 401 and LLM7 is off by default.
+ENABLE_KILO = os.getenv("ENABLE_KILO", "false").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_LLM7 = os.getenv("ENABLE_LLM7", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ---------- AI CALL CONCURRENCY THROTTLE ----------
 
-# Cap concurrent in-flight AI provider calls to avoid bursting past per-minute
-# rate limits (Phase 13, Option 1). Increased to 10 for faster analysis.
-AI_CALL_SEMAPHORE = asyncio.Semaphore(10)
+# Cap concurrent in-flight AI provider calls. Kept consistent with
+# ANALYZE_CONCURRENCY so one analysis run cannot burst past its own bound.
+AI_CALL_SEMAPHORE = asyncio.Semaphore(
+    max(1, int(os.getenv("AI_CALL_CONCURRENCY", str(ANALYZE_CONCURRENCY))))
+)
 
 
 # ---------- COHERE PER-PROVIDER RATE LIMITER (Phase 16, Option B) ----------
@@ -202,7 +239,8 @@ Use these rules when deciding the scam_score:
 - If the email asks for passwords, credit card numbers, OTP codes, or personal identification numbers, add 30 to the base score.
 - Legitimate system-generated emails such as OTP codes, order confirmations, and bank transaction alerts from matching sender domains should receive a scam_score of 5 or below.
 
-You must respond with ONLY a valid JSON object. Do not include markdown, backticks, or any text outside the JSON object. The JSON must have exactly these four fields: label, scam_score, scam_indicators, reasoning.
+You must respond with ONLY a valid JSON object. Do not include markdown, backticks, or any text outside the JSON object. The JSON must have exactly these four fields: label (string, one value copied verbatim from the Available Labels list below), scam_score (integer 0-100), scam_indicators (array of strings), reasoning (string).
+Any "label" value that is not byte-for-byte identical to one of the Available Labels is treated as invalid.
 
 Input:
 Sender: {sender}
@@ -228,12 +266,166 @@ Original text:
 
 class QuotaError(Exception):
     """Raised when an AI provider returns 429 (quota/rate limit exceeded)."""
-    pass
+
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class ProviderError(Exception):
-    """Raised when an AI provider returns a non-recoverable error."""
-    pass
+    """Raised when an AI provider returns a non-recoverable error.
+
+    `transient` marks failures (5xx, timeout, connection reset) that should
+    open the shared circuit breaker; permanent errors (401/400) only skip the
+    provider for the current cascade.
+    """
+
+    def __init__(self, message: str, transient: bool = False, retry_after: float | None = None):
+        super().__init__(message)
+        self.transient = transient
+        self.retry_after = retry_after
+
+
+def _parse_retry_after(response: httpx.Response) -> float | None:
+    """Parse a Retry-After header (seconds or HTTP-date) into float seconds."""
+    try:
+        raw = response.headers.get("Retry-After")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    raw = raw.strip()
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        pass
+    try:
+        when = parsedate_to_datetime(raw)
+        delta = (when - datetime.now(when.tzinfo)).total_seconds()
+        return max(0.0, delta)
+    except Exception:
+        return None
+
+
+# ---------- SHARED CIRCUIT BREAKER (Phase 2, Task 7) ----------
+
+class _ProviderBreaker:
+    """
+    Process-wide circuit breaker shared by every email in the run.
+
+    A provider that returns 429/5xx/timeout is skipped for a cooldown
+    (Retry-After when supplied, otherwise AI_BREAKER_COOLDOWN), clamped to
+    [AI_BREAKER_MIN_COOLDOWN, AI_BREAKER_MAX_COOLDOWN]. Once the cooldown
+    elapses a single half-open probe is admitted; success closes the circuit,
+    another failure re-opens it.
+    """
+
+    def __init__(self):
+        self._open_until: dict[str, float] = {}
+        self._probe_in_flight: set[str] = set()
+        self._lock = asyncio.Lock()
+
+    async def is_available(self, name: str) -> bool:
+        async with self._lock:
+            until = self._open_until.get(name)
+            if until is None:
+                return True
+            if time.monotonic() < until:
+                return False
+            # Half-open: admit a single probe, block the rest.
+            if name in self._probe_in_flight:
+                return False
+            self._probe_in_flight.add(name)
+            return True
+
+    async def record_success(self, name: str) -> None:
+        async with self._lock:
+            self._open_until.pop(name, None)
+            self._probe_in_flight.discard(name)
+
+    async def record_failure(self, name: str, retry_after: float | None = None) -> None:
+        async with self._lock:
+            self._probe_in_flight.discard(name)
+            if retry_after is not None:
+                # Task 6: honour the provider's Retry-After (small floor to avoid
+                # thrash, capped so one provider cannot stall the run forever).
+                cooldown = min(AI_BREAKER_MAX_COOLDOWN, max(1.0, retry_after))
+            else:
+                # Task 7: no hint -> default 30-60s window.
+                cooldown = max(AI_BREAKER_MIN_COOLDOWN,
+                               min(AI_BREAKER_MAX_COOLDOWN, AI_BREAKER_COOLDOWN))
+            self._open_until[name] = time.monotonic() + cooldown
+            logger.info(
+                "[AI BREAKER] %s open for %.0fs (retry_after=%s)",
+                name, cooldown, retry_after,
+            )
+
+    def snapshot(self) -> dict[str, float]:
+        """Remaining cooldown seconds per open provider (0 entries omitted)."""
+        now = time.monotonic()
+        return {
+            name: round(until - now, 1)
+            for name, until in self._open_until.items()
+            if until > now
+        }
+
+
+# One breaker for the whole process — every email shares it.
+AI_BREAKER = _ProviderBreaker()
+
+
+# ---------- LABEL MATCHING (Phase 2, Task 9) ----------
+
+def match_label(label, available_labels: list[str], cutoff: float = 0.84) -> str | None:
+    """
+    Resolve an AI-returned label against the available labels.
+
+    Exact match first, then case-insensitive match, then a conservative fuzzy
+    match on normalized text. Returns the canonical label name, or None.
+    """
+    if not isinstance(label, str) or not available_labels:
+        return None
+    candidate = label.strip()
+    if not candidate:
+        return None
+
+    for name in available_labels:
+        if name == candidate:
+            return name
+    folded = candidate.casefold()
+    for name in available_labels:
+        if name.casefold() == folded:
+            return name
+
+    def _normalize(value: str) -> str:
+        return "".join(ch for ch in value.casefold() if ch.isalnum())
+
+    normalized = _normalize(candidate)
+    if not normalized:
+        return None
+    for name in available_labels:
+        if _normalize(name) == normalized:
+            return name
+    close = difflib.get_close_matches(
+        candidate.casefold(), [n.casefold() for n in available_labels], n=1, cutoff=cutoff
+    )
+    if close:
+        target = close[0]
+        for name in available_labels:
+            if name.casefold() == target:
+                return name
+    return None
+
+
+LABEL_ONLY_PROMPT = """You are labeling an email. Respond with ONLY a JSON object of the form {{"label": "<one label>"}}.
+
+Available Labels: {available_labels}
+
+Email:
+Sender: {sender}
+Subject: {subject}
+Body: {body}
+"""
 
 
 # ---------- AI ROUTER CLASS ----------
@@ -249,9 +441,9 @@ class AIRouter:
     """
 
     def __init__(self):
-        # httpx client with 30-second timeout for all requests
-        self.client = httpx.Client(timeout=30.0)
-        self.async_client = httpx.AsyncClient(timeout=30.0)
+        # Phase 2 Task 6: per-provider timeout (was 30s) + overall AI deadline.
+        self.client = httpx.Client(timeout=AI_PROVIDER_TIMEOUT)
+        self.async_client = httpx.AsyncClient(timeout=AI_PROVIDER_TIMEOUT)
         self._gemini_key_index = 0
         self._gemini_index_lock = asyncio.Lock()  # Protects Gemini key rotation
         self._groq_key_index = 0
@@ -262,13 +454,55 @@ class AIRouter:
             f"groq={len(GROQ_API_KEYS)} keys, "
             f"cloudflare={bool(CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN)}, "
             f"mistral={bool(MISTRAL_API_KEY)}, "
-            f"gemini={bool(GEMINI_API_KEY)}, "
+            f"gemini={bool(GEMINI_API_KEYS)}, "
             f"cohere={bool(COHERE_API_KEY)}, "
             f"zai={bool(ZAI_API_KEY)}, "
-            f"nvidia={bool(NVIDIA_API_KEY)}, "
+            f"nvidia={bool(NVIDIA_API_KEY and NVIDIA_MODEL)}, "
             f"openrouter={bool(OPENROUTER_API_KEY)}, "
-            f"llm7=keyless, kilo=keyless, ovh=keyless",
+            f"llm7={'enabled' if ENABLE_LLM7 else 'disabled'}, "
+            f"kilo={'enabled' if ENABLE_KILO else 'disabled'}, "
+            f"ovh=keyless"
         )
+        # Phase 2 Task 5: only providers configured at startup enter the cascade.
+        self._provider_registry: dict[str, Callable[[str], "asyncio.Future[str]"] ] = {
+            "groq": self._call_groq,
+            "gemini": self._call_gemini,
+            "cohere": self._call_cohere,
+            "ovh": self._call_ovh,
+            "openrouter": self._call_openrouter,
+            "cloudflare": self._call_cloudflare,
+            "mistral": self._call_mistral,
+            "zai": self._call_zai,
+            "nvidia": self._call_nvidia,
+            "llm7": self._call_llm7,
+            "kilo": self._call_kilo,
+        }
+        self._configured = self._resolve_configured_providers()
+        logger.info(f"[AI ROUTER] Cascade order: {' -> '.join(self._configured) or 'none'}")
+
+    def _resolve_configured_providers(self) -> list[str]:
+            """Return the env-ordered subset of providers actually configured."""
+            availability = {
+                "groq": bool(GROQ_API_KEYS),
+                "gemini": bool(GEMINI_API_KEYS),
+                "cohere": bool(COHERE_API_KEY),
+                "ovh": True,
+                "openrouter": bool(OPENROUTER_API_KEY),
+                "cloudflare": bool(CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN),
+                "mistral": bool(MISTRAL_API_KEY),
+                "zai": bool(ZAI_API_KEY),
+                # NVIDIA's default model is retired; require an explicit model to enable it.
+                "nvidia": bool(NVIDIA_API_KEY and NVIDIA_MODEL),
+                # Kilo 401s without a key and LLM7 is off by default — opt-in only.
+                "kilo": ENABLE_KILO,
+                "llm7": ENABLE_LLM7,
+            }
+            ordered = [name for name in AI_PROVIDER_ORDER if name in availability]
+            selected = [name for name in ordered if availability[name]]
+            unknown = [name for name in ordered if name not in self._provider_registry]
+            if unknown:
+                logger.warning(f"[AI ROUTER] Unknown providers in AI_PROVIDER_ORDER: {unknown}")
+            return selected
 
     # ---------- PROVIDER: NVIDIA (PLACEHOLDER — NOT IN ACTIVE CASCADE) ----------
 
@@ -287,8 +521,8 @@ class AIRouter:
             QuotaError: If status 429 (rate limited)
             ProviderError: If any other error occurs
         """
-        if not NVIDIA_API_KEY:
-            raise ProviderError("NVIDIA API key not configured")
+        if not (NVIDIA_API_KEY and NVIDIA_MODEL):
+            raise ProviderError("NVIDIA not configured (set NVIDIA_API_KEY and NVIDIA_MODEL)")
 
         url = "https://integrate.api.nvidia.com/v1/chat/completions"
         headers = {
@@ -296,7 +530,7 @@ class AIRouter:
             "Content-Type": "application/json",
         }
         body = {
-            "model": "meta/llama-3.1-8b-instruct",
+            "model": NVIDIA_MODEL,
             "messages": [{
                 "role": "system",
                 "content": (
@@ -327,7 +561,7 @@ class AIRouter:
             return raw_content.strip()
 
         except httpx.TimeoutException:
-            raise ProviderError("NVIDIA request timed out (30s)")
+            raise ProviderError("NVIDIA request timed out ({0:.0f}s)".format(AI_PROVIDER_TIMEOUT), transient=True)
 
     # ---------- PROVIDER: GROQ (PRIMARY) ----------
 
@@ -365,6 +599,7 @@ class AIRouter:
 
         quota_errors = 0
         other_errors = []
+        last_retry_after = None
         
         # Try all keys in rotation before giving up
         # Lock ensures atomicity of read-modify-write on key index
@@ -384,6 +619,7 @@ class AIRouter:
                 if response.status_code == 429:
                     quota_errors += 1
                     retry_after = response.headers.get("Retry-After")
+                    last_retry_after = _parse_retry_after(response)
                     logger.info(f"[AI] Groq key #{key_index + 1} quota hit, trying next key...")
                     continue  # Try next key immediately
 
@@ -400,7 +636,7 @@ class AIRouter:
                 return data["choices"][0]["message"]["content"].strip()
 
             except httpx.TimeoutException:
-                error_msg = f"Groq key #{key_index + 1} timed out (30s)"
+                error_msg = f"Groq key #{key_index + 1} timed out ({AI_PROVIDER_TIMEOUT:.0f}s)"
                 other_errors.append(error_msg)
                 logger.info(f"[AI] {error_msg}, trying next key...")
                 continue  # Try next key
@@ -412,7 +648,9 @@ class AIRouter:
 
         # All keys exhausted - raise appropriate error
         if quota_errors == len(GROQ_API_KEYS):
-            raise QuotaError(f"All {len(GROQ_API_KEYS)} Groq API keys exhausted (quota)")
+            raise QuotaError(
+                f"All {len(GROQ_API_KEYS)} Groq API keys exhausted (quota)", last_retry_after
+            )
         else:
             raise ProviderError(f"All {len(GROQ_API_KEYS)} Groq keys failed: {' | '.join(other_errors)}")
 
@@ -440,6 +678,7 @@ class AIRouter:
             self._gemini_key_index += 1
 
         last_quota_error = None
+        last_retry_after = None
         for offset in range(len(GEMINI_API_KEYS)):
             key = GEMINI_API_KEYS[(start_index + offset) % len(GEMINI_API_KEYS)]
 
@@ -477,19 +716,26 @@ class AIRouter:
                         f"Gemini quota exceeded: {response.text[:300]} | "
                         f"retry-after={retry_after}"
                     )
+                    last_retry_after = _parse_retry_after(response)
                     continue
 
                 if response.status_code != 200:
-                    raise ProviderError(f"Gemini error {response.status_code}: {response.text[:200]}")
+                    raise ProviderError(
+                        f"Gemini error {response.status_code}: {response.text[:200]}",
+                        transient=response.status_code >= 500 or response.status_code == 408,
+                        retry_after=_parse_retry_after(response),
+                    )
 
                 data = response.json()
                 # Gemini response structure: candidates[0].content.parts[0].text
                 return data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
             except httpx.TimeoutException:
-                raise ProviderError("Gemini request timed out (30s)")
+                raise ProviderError(
+                    f"Gemini request timed out ({AI_PROVIDER_TIMEOUT:.0f}s)", transient=True
+                )
 
-        raise QuotaError(last_quota_error or "All Gemini API keys exhausted (quota)")
+        raise QuotaError(last_quota_error or "All Gemini API keys exhausted (quota)", last_retry_after)
 
     # ---------- PROVIDER: COHERE (TERTIARY) ----------
 
@@ -528,17 +774,20 @@ class AIRouter:
 
             if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
-                raise QuotaError(f"Cohere quota exceeded: {response.text[:300]} | retry-after={retry_after}")
+                raise QuotaError(f"Cohere quota exceeded: {response.text[:300]} | retry-after={retry_after}", _parse_retry_after(response))
 
             if response.status_code != 200:
-                raise ProviderError(f"Cohere error {response.status_code}: {response.text[:200]}")
+                raise ProviderError(
+                    f"Cohere error {response.status_code}: {response.text[:200]}",
+                    transient=response.status_code >= 500, retry_after=_parse_retry_after(response),
+                )
 
             data = response.json()
             # v2 API response: message.content[0].text
             return data["message"]["content"][0]["text"].strip()
 
         except httpx.TimeoutException:
-            raise ProviderError("Cohere request timed out (30s)")
+            raise ProviderError("Cohere request timed out ({0:.0f}s)".format(AI_PROVIDER_TIMEOUT), transient=True)
 
     # ---------- PROVIDER: OPENROUTER (QUINARY) ----------
 
@@ -589,16 +838,19 @@ class AIRouter:
 
             if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
-                raise QuotaError(f"OpenRouter quota exceeded: {response.text[:300]} | retry-after={retry_after}")
+                raise QuotaError(f"OpenRouter quota exceeded: {response.text[:300]} | retry-after={retry_after}", _parse_retry_after(response))
 
             if response.status_code != 200:
-                raise ProviderError(f"OpenRouter error {response.status_code}: {response.text[:200]}")
+                raise ProviderError(
+                    f"OpenRouter error {response.status_code}: {response.text[:200]}",
+                    transient=response.status_code >= 500, retry_after=_parse_retry_after(response),
+                )
 
             data = response.json()
             return data["choices"][0]["message"]["content"].strip()
 
         except httpx.TimeoutException:
-            raise ProviderError("OpenRouter request timed out (30s)")
+            raise ProviderError("OpenRouter request timed out ({0:.0f}s)".format(AI_PROVIDER_TIMEOUT), transient=True)
         except KeyError as e:
             raise ProviderError(f"OpenRouter unexpected response format: missing {e}")
 
@@ -632,15 +884,16 @@ class AIRouter:
         try:
             response = await self.async_client.post(url, headers=headers, json=body)
             if response.status_code == 429:
-                raise QuotaError(f"Cloudflare quota exceeded: {response.text[:200]}")
+                raise QuotaError(f"Cloudflare quota exceeded: {response.text[:200]}", _parse_retry_after(response))
             if response.status_code != 200:
                 raise ProviderError(
-                    f"Cloudflare error {response.status_code}: {response.text[:200]}"
+                    f"Cloudflare error {response.status_code}: {response.text[:200]}",
+                    transient=response.status_code >= 500, retry_after=_parse_retry_after(response),
                 )
             data = response.json()
             return data["choices"][0]["message"]["content"].strip()
         except httpx.TimeoutException:
-            raise ProviderError("Cloudflare request timed out (30s)")
+            raise ProviderError("Cloudflare request timed out ({0:.0f}s)".format(AI_PROVIDER_TIMEOUT), transient=True)
 
     # ---------- PROVIDER: MISTRAL AI ----------
 
@@ -664,15 +917,16 @@ class AIRouter:
         try:
             response = await self.async_client.post(url, headers=headers, json=body)
             if response.status_code == 429:
-                raise QuotaError(f"Mistral quota exceeded: {response.text[:200]}")
+                raise QuotaError(f"Mistral quota exceeded: {response.text[:200]}", _parse_retry_after(response))
             if response.status_code != 200:
                 raise ProviderError(
-                    f"Mistral error {response.status_code}: {response.text[:200]}"
+                    f"Mistral error {response.status_code}: {response.text[:200]}",
+                    transient=response.status_code >= 500, retry_after=_parse_retry_after(response),
                 )
             data = response.json()
             return data["choices"][0]["message"]["content"].strip()
         except httpx.TimeoutException:
-            raise ProviderError("Mistral request timed out (30s)")
+            raise ProviderError("Mistral request timed out ({0:.0f}s)".format(AI_PROVIDER_TIMEOUT), transient=True)
 
     # ---------- PROVIDER: Z AI (ZHIPU BIGMODEL) ----------
 
@@ -696,15 +950,16 @@ class AIRouter:
         try:
             response = await self.async_client.post(url, headers=headers, json=body)
             if response.status_code == 429:
-                raise QuotaError(f"Z AI quota exceeded: {response.text[:200]}")
+                raise QuotaError(f"Z AI quota exceeded: {response.text[:200]}", _parse_retry_after(response))
             if response.status_code != 200:
                 raise ProviderError(
-                    f"Z AI error {response.status_code}: {response.text[:200]}"
+                    f"Z AI error {response.status_code}: {response.text[:200]}",
+                    transient=response.status_code >= 500, retry_after=_parse_retry_after(response),
                 )
             data = response.json()
             return data["choices"][0]["message"]["content"].strip()
         except httpx.TimeoutException:
-            raise ProviderError("Z AI request timed out (30s)")
+            raise ProviderError("Z AI request timed out ({0:.0f}s)".format(AI_PROVIDER_TIMEOUT), transient=True)
 
     # ---------- KEYLESS FALLBACKS ----------
 
@@ -729,15 +984,16 @@ class AIRouter:
         try:
             response = await self.async_client.post(url, headers=headers, json=body)
             if response.status_code == 429:
-                raise QuotaError(f"LLM7 quota exceeded: {response.text[:200]}")
+                raise QuotaError(f"LLM7 quota exceeded: {response.text[:200]}", _parse_retry_after(response))
             if response.status_code != 200:
                 raise ProviderError(
-                    f"LLM7 error {response.status_code}: {response.text[:200]}"
+                    f"LLM7 error {response.status_code}: {response.text[:200]}",
+                    transient=response.status_code >= 500, retry_after=_parse_retry_after(response),
                 )
             data = response.json()
             return data["choices"][0]["message"]["content"].strip()
         except httpx.TimeoutException:
-            raise ProviderError("LLM7 request timed out (30s)")
+            raise ProviderError("LLM7 request timed out ({0:.0f}s)".format(AI_PROVIDER_TIMEOUT), transient=True)
 
     async def _call_kilo(self, prompt: str) -> str:
         """Call Kilo Code gateway (keyless, routes to a free pooled model)."""
@@ -755,15 +1011,16 @@ class AIRouter:
         try:
             response = await self.async_client.post(url, headers=headers, json=body)
             if response.status_code == 429:
-                raise QuotaError(f"Kilo Code quota exceeded: {response.text[:200]}")
+                raise QuotaError(f"Kilo Code quota exceeded: {response.text[:200]}", _parse_retry_after(response))
             if response.status_code != 200:
                 raise ProviderError(
-                    f"Kilo Code error {response.status_code}: {response.text[:200]}"
+                    f"Kilo Code error {response.status_code}: {response.text[:200]}",
+                    transient=response.status_code >= 500, retry_after=_parse_retry_after(response),
                 )
             data = response.json()
             return data["choices"][0]["message"]["content"].strip()
         except httpx.TimeoutException:
-            raise ProviderError("Kilo Code request timed out (30s)")
+            raise ProviderError("Kilo Code request timed out ({0:.0f}s)".format(AI_PROVIDER_TIMEOUT), transient=True)
 
     async def _call_ovh(self, prompt: str) -> str:
         """Call OVHcloud AI Endpoints (keyless, Llama 3.3 70B, hard 2 RPM/IP)."""
@@ -781,92 +1038,144 @@ class AIRouter:
         try:
             response = await self.async_client.post(url, headers=headers, json=body)
             if response.status_code == 429:
-                raise QuotaError(f"OVH quota exceeded: {response.text[:200]}")
+                raise QuotaError(f"OVH quota exceeded: {response.text[:200]}", _parse_retry_after(response))
             if response.status_code != 200:
                 raise ProviderError(
-                    f"OVH error {response.status_code}: {response.text[:200]}"
+                    f"OVH error {response.status_code}: {response.text[:200]}",
+                    transient=response.status_code >= 500, retry_after=_parse_retry_after(response),
                 )
             data = response.json()
             return data["choices"][0]["message"]["content"].strip()
         except httpx.TimeoutException:
-            raise ProviderError("OVH request timed out (30s)")
+            raise ProviderError("OVH request timed out ({0:.0f}s)".format(AI_PROVIDER_TIMEOUT), transient=True)
 
 
-    async def analyze(self, prompt: str) -> dict:
-        """Run a prompt through the configured provider cascade."""
-        providers = [
-            ("Groq", self._call_groq),
-            ("Gemini", self._call_gemini),
-            ("Cohere", self._call_cohere),
-            ("OpenRouter", self._call_openrouter),
-            ("Cloudflare", self._call_cloudflare),
-            ("Mistral", self._call_mistral),
-            ("Z AI", self._call_zai),
-            ("LLM7", self._call_llm7),
-            ("Kilo", self._call_kilo),
-            ("OVH", self._call_ovh),
-        ]
+    # ---------- CASCADE HELPERS (Phase 2) ----------
 
-        errors = []
-        for name, call_fn in providers:
-            try:
-                logger.info(f"[AI] Trying {name}...")
-                async with AI_CALL_SEMAPHORE:
-                    response = await call_fn(prompt)
-                logger.info(f"[AI] {name} responded successfully.")
-                return {"response": response, "provider_used": name}
-            except QuotaError as exc:
-                errors.append(f"{name}: quota: {exc}")
-                logger.info(f"[AI] {name} quota hit; switching provider.")
-            except (ProviderError, Exception) as exc:
-                errors.append(f"{name}: {type(exc).__name__}: {exc}")
-                logger.info(f"[AI] {name} failed; switching provider: {exc}")
-
-        return {
-            "error": "All AI providers exhausted: " + " | ".join(errors),
-            "provider_used": None,
+    def _cascade_providers(self):
+        """Return (display_name, call_fn) pairs in configured order."""
+        display = {
+            "groq": "Groq", "gemini": "Gemini", "cohere": "Cohere", "ovh": "OVH",
+            "openrouter": "OpenRouter", "cloudflare": "Cloudflare",
+            "mistral": "Mistral", "zai": "Z AI", "nvidia": "NVIDIA",
+            "llm7": "LLM7", "kilo": "Kilo",
         }
+        return [(display[name], self._provider_registry[name]) for name in self._configured]
 
-    async def analyze_json(self, prompt: str) -> dict:
-        """Run the cascade and continue past providers with invalid JSON."""
-        providers = [
-            ("Groq", self._call_groq),
-            ("NVIDIA", self._call_nvidia),
-            ("Gemini", self._call_gemini),
-            ("Cohere", self._call_cohere),
-            ("OpenRouter", self._call_openrouter),
-            ("Cloudflare", self._call_cloudflare),
-            ("Mistral", self._call_mistral),
-            ("Z AI", self._call_zai),
-            ("LLM7", self._call_llm7),
-            ("Kilo", self._call_kilo),
-            ("OVH", self._call_ovh),
-        ]
+    async def _call_with_timeout(self, name, call_fn, prompt):
+        """Invoke one provider bounded by the per-provider timeout."""
+        try:
+            return await asyncio.wait_for(call_fn(prompt), timeout=AI_PROVIDER_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise ProviderError(
+                "{0} timed out ({1:.0f}s)".format(name, AI_PROVIDER_TIMEOUT), transient=True
+            )
+
+    async def _run_cascade(self, prompt, parse_json):
+        """
+        Shared cascade loop for both analyze() and analyze_json().
+
+        Phase 2 Task 5: only startup-configured providers are attempted.
+        Phase 2 Task 6: overall per-email AI deadline + Retry-After honoured.
+        Phase 2 Task 7: shared circuit breaker skips cooling-down providers.
+        """
+        deadline = time.monotonic() + AI_DEADLINE
         errors = []
+        providers = self._cascade_providers()
+        if not providers:
+            return {"error": "No AI providers configured", "provider_used": None}
+
         for name, call_fn in providers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                errors.append("cascade deadline exceeded ({0:.0f}s)".format(AI_DEADLINE))
+                logger.info("[AI] Overall AI deadline exceeded; stopping cascade.")
+                break
+
+            if not await AI_BREAKER.is_available(name):
+                errors.append(name + ": circuit open")
+                logger.info("[AI] {0} skipped (circuit open).".format(name))
+                continue
+
             try:
-                logger.info(f"[AI] Trying {name}...")
+                logger.info("[AI] Trying {0}...".format(name))
                 async with AI_CALL_SEMAPHORE:
-                    response = await call_fn(prompt)
-                cleaned = response.strip().replace("```json", "").replace("```", "").strip()
-                try:
-                    data = json.loads(cleaned)
-                except json.JSONDecodeError:
-                    start = cleaned.find("{")
-                    end = cleaned.rfind("}")
-                    if start < 0 or end <= start:
-                        raise ValueError("AI response was not valid JSON")
-                    data = json.loads(cleaned[start:end + 1])
-                logger.info(f"[AI] {name} responded successfully with valid JSON.")
-                return {"data": data, "provider_used": name}
+                    response = await asyncio.wait_for(
+                        self._call_with_timeout(name, call_fn, prompt),
+                        timeout=remaining,
+                    )
+                if parse_json:
+                    data = self._parse_json_response(response)
+                    await AI_BREAKER.record_success(name)
+                    logger.info("[AI] {0} responded successfully with valid JSON.".format(name))
+                    return {"data": data, "provider_used": name}
+                await AI_BREAKER.record_success(name)
+                logger.info("[AI] {0} responded successfully.".format(name))
+                return {"response": response, "provider_used": name}
+
             except QuotaError as exc:
-                errors.append(f"{name}: quota: {exc}")
-                logger.info(f"[AI] {name} quota hit; switching provider.")
+                errors.append("{0}: quota: {1}".format(name, exc))
+                logger.info("[AI] {0} quota hit; switching provider.".format(name))
+                await AI_BREAKER.record_failure(name, getattr(exc, "retry_after", None))
+            except asyncio.TimeoutError:
+                errors.append(name + ": timeout")
+                logger.info("[AI] {0} exceeded remaining deadline; switching provider.".format(name))
+                await AI_BREAKER.record_failure(name)
+            except ProviderError as exc:
+                errors.append("{0}: {1}: {2}".format(name, type(exc).__name__, exc))
+                logger.info("[AI] {0} failed; switching provider: {1}".format(name, exc))
+                if exc.transient:
+                    await AI_BREAKER.record_failure(name, exc.retry_after)
+            except ValueError as exc:
+                # Invalid JSON from an otherwise healthy provider: skip, keep available.
+                errors.append("{0}: invalid JSON: {1}".format(name, exc))
+                logger.info("[AI] {0} returned invalid JSON; switching provider.".format(name))
             except Exception as exc:
-                errors.append(f"{name}: {type(exc).__name__}: {exc}")
-                logger.info(f"[AI] {name} failed; switching provider: {exc}")
+                errors.append("{0}: {1}: {2}".format(name, type(exc).__name__, exc))
+                logger.info("[AI] {0} failed; switching provider: {1}".format(name, exc))
+
         return {"error": "All AI providers exhausted: " + " | ".join(errors), "provider_used": None}
+
+    @staticmethod
+    def _parse_json_response(response):
+        """Parse a provider response into JSON, tolerating fences and prose."""
+        cleaned = response.strip().replace("```json", "").replace("```", "").strip()
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            jstart = cleaned.find("{")
+            jend = cleaned.rfind("}")
+            if jstart < 0 or jend <= jstart:
+                raise ValueError("AI response was not valid JSON")
+            return json.loads(cleaned[jstart:jend + 1])
+
+    async def analyze(self, prompt):
+        """Run a prompt through the configured provider cascade."""
+        return await self._run_cascade(prompt, parse_json=False)
+
+    async def analyze_json(self, prompt):
+        """Run the cascade and continue past providers with invalid JSON."""
+        return await self._run_cascade(prompt, parse_json=True)
+
+    async def label_only(self, sender, subject, body, available_labels):
+        """
+        Phase 2 Task 9: one tiny follow-up call asking only for the label.
+
+        Used when a response carried a valid scam_score but an unusable label.
+        Returns the canonical label name, or None if it cannot be resolved.
+        """
+        if not available_labels:
+            return None
+        prompt = LABEL_ONLY_PROMPT.format(
+            available_labels=", ".join(available_labels),
+            sender=sender, subject=subject, body=(body or "")[:1500],
+        )
+        result = await self._run_cascade(prompt, parse_json=True)
+        data = result.get("data")
+        if not isinstance(data, dict):
+            return None
+        return match_label(data.get("label"), available_labels)
+
 
 
 ai_router = AIRouter()
-

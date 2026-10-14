@@ -811,7 +811,7 @@ async def analyze_bulk_ordered(limit: int = 50, user_id: int = None, user_email:
         user_id: The authenticated user's ID
         user_email: The authenticated user's gmail_address (used to load their token)
     """
-    from ai_router import ai_router, CLASSIFICATION_PROMPT
+    from ai_router import ai_router, CLASSIFICATION_PROMPT, ANALYZE_CONCURRENCY
     from security import extract_urls, scan_url
     import httpx
     import time
@@ -821,7 +821,7 @@ async def analyze_bulk_ordered(limit: int = 50, user_id: int = None, user_email:
     if user_email is None and user_id is not None:
         user_email = get_user_email_by_id(user_id)
 
-    semaphore = asyncio.Semaphore(2)
+    semaphore = asyncio.Semaphore(ANALYZE_CONCURRENCY)
     url_semaphore = asyncio.Semaphore(8)
     # Phase 1 Task 4: Offload blocking service build to thread pool
     service = await asyncio.to_thread(get_gmail_service, user_email)
@@ -1153,14 +1153,26 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                 }
 
             label = routed.get("label", "Unknown")
-            match = next((name for name in available_label_names
-                          if isinstance(label, str) and name.casefold() == label.strip().casefold()), None)
+            score = routed.get("scam_score")
+
+            # Phase 2 Task 9: case-insensitive + fuzzy match against real labels.
+            from ai_router import match_label
+            match = match_label(label, available_label_names)
+            if match is None and isinstance(score, int) and not isinstance(score, bool) and 0 <= score <= 100:
+                # Label unusable but score valid: ONE tiny follow-up call for the label only.
+                try:
+                    match = await ai_router.label_only(
+                        sender, subject, _analysis_text(body)[:1500], available_label_names)
+                except Exception as label_error:
+                    logger.info("[PIPELINE] Label-only retry failed for %s: %s", email_id[:12], label_error)
+                if match:
+                    routed["label"] = match
+
             category_status = routed.get("category_status", "completed" if match else "unavailable")
             if category_status == "complete":
                 category_status = "completed"
             label = match if match and category_status == "completed" else "Unknown"
             label_id = get_label_id_by_name(user_id, label) if label != "Unknown" else None
-            score = routed.get("scam_score")
             if isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 100:
                 raise ValueError("No valid security assessment")
             indicators = routed.get("scam_indicators", [])
@@ -1313,14 +1325,14 @@ async def label_only_pipeline(limit: int = None, user_id: int = None, user_email
         user_email: User's email address
         email_ids: Optional list of specific email IDs to process (exact retry targets)
     """
-    from ai_router import ai_router, CLASSIFICATION_PROMPT
+    from ai_router import ai_router, CLASSIFICATION_PROMPT, ANALYZE_CONCURRENCY
     from database import get_emails_by_status, get_emails_by_ids
     import httpx
 
     if user_email is None and user_id is not None:
         user_email = get_user_email_by_id(user_id)
 
-    semaphore = asyncio.Semaphore(2)
+    semaphore = asyncio.Semaphore(ANALYZE_CONCURRENCY)
     url_semaphore = asyncio.Semaphore(8)
     # Phase 1 Task 4: Offload blocking service build to thread pool
     service = await asyncio.to_thread(get_gmail_service, user_email)
