@@ -21,7 +21,8 @@ load_dotenv()
 SAFE_BROWSING_KEY = os.getenv("GOOGLE_SAFE_BROWSING_KEY")
 URL_SAFETY_CACHE: dict[str, tuple[int, str | None]] = {}
 _cache_lock = asyncio.Lock()  # Protects URL_SAFETY_CACHE from concurrent access
-URL_CHECK_TIMEOUT_SECONDS = 5.0
+URL_CHECK_TIMEOUT_SECONDS = 5.0  # Legacy scan_url() timeout (deprecated)
+BATCH_SCAN_TIMEOUT = 8.0  # Phase 3 Task 10: Batch scan timeout
 
 
 def extract_urls(text: str) -> list[str]:
@@ -88,6 +89,216 @@ def _extract_domain(url: str) -> str | None:
         return domain
     except Exception:
         return None
+
+
+async def scan_urls_batch(urls: list[str], email_id: str,
+                          client: httpx.AsyncClient) -> dict[str, dict]:
+    """
+    Check multiple URLs against Google Safe Browsing API v4 in a single batch request.
+    
+    Phase 3 (Tasks 10-11): Replaces one-request-per-URL with batched threatMatches:find.
+    - Single API request with all deduped URLs in threatEntries[] (cap 500)
+    - 8s timeout (up from 5s)
+    - 1 retry with jitter on timeout/5xx
+    - Cache checked before batch, saved after
+    - Never cache failed scans as safe
+    - Scan failures do NOT downgrade analysis_status
+    
+    Args:
+        urls: List of URLs to check (will be deduped)
+        email_id: Gmail message ID for cache association
+        client: Shared httpx.AsyncClient
+    
+    Returns:
+        Dict mapping each URL to result dict with keys:
+        - url: the URL
+        - is_safe: 0=unsafe, 1=safe, None=scan_failed
+        - threat_type: threat name if unsafe, else None
+        - scan_failed: bool
+    """
+    from database import get_cached_url, save_url_result
+    
+    if not urls:
+        return {}
+    
+    # Dedupe and cap at 500 (Safe Browsing API limit)
+    unique_urls = list(dict.fromkeys(urls))[:500]
+    
+    # Step 1: Check cache for ALL URLs first
+    results = {}
+    uncached_urls = []
+    
+    for url in unique_urls:
+        # Check in-memory cache first (fast path)
+        async with _cache_lock:
+            cached_result = URL_SAFETY_CACHE.get(url)
+            if cached_result is not None:
+                logger.info(f"[SECURITY] In-memory cache hit: {url[:60]}")
+                results[url] = {
+                    "url": url,
+                    "is_safe": cached_result[0],
+                    "threat_type": cached_result[1],
+                    "scan_failed": False
+                }
+                continue
+        
+        # Check persistent cache (offload to thread)
+        cached = await asyncio.to_thread(get_cached_url, url)
+        if cached is not None:
+            logger.info(f"[SECURITY] DB cache hit: {url[:60]}")
+            results[url] = {
+                "url": url,
+                "is_safe": cached["is_safe"],
+                "threat_type": cached["threat_type"],
+                "scan_failed": False
+            }
+            # Warm in-memory cache
+            async with _cache_lock:
+                URL_SAFETY_CACHE[url] = (cached["is_safe"], cached["threat_type"])
+        else:
+            uncached_urls.append(url)
+    
+    if not uncached_urls:
+        logger.info(f"[SECURITY] All {len(unique_urls)} URLs cached, no API call needed")
+        return results
+    
+    # Step 2: API key check
+    if not SAFE_BROWSING_KEY or SAFE_BROWSING_KEY == "your_key_here":
+        logger.info(f"[SECURITY] WARNING: Safe Browsing API key not configured. {len(uncached_urls)} URLs unavailable")
+        for url in uncached_urls:
+            results[url] = {
+                "url": url,
+                "is_safe": None,
+                "threat_type": None,
+                "scan_failed": True,
+                "verdict": "unavailable",
+                "reason": "safe_browsing_not_configured"
+            }
+        return results
+    
+    # Step 3: Build batch request
+    endpoint = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
+    headers = {"x-goog-api-key": SAFE_BROWSING_KEY}
+    body = {
+        "client": {
+            "clientId": "gmail-manager",
+            "clientVersion": "1.0",
+        },
+        "threatInfo": {
+            "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE"],
+            "platformTypes": ["ANY_PLATFORM"],
+            "threatEntryTypes": ["URL"],
+            "threatEntries": [{"url": url} for url in uncached_urls],
+        },
+    }
+    
+    logger.info(f"[SECURITY] Batch scanning {len(uncached_urls)} uncached URLs (timeout {BATCH_SCAN_TIMEOUT}s, 1 retry)")
+    
+    # Step 4: Call API with retry (timeout/5xx only)
+    MAX_ATTEMPTS = 2  # 1 retry = 2 total attempts
+    
+    response = None
+    last_exception = None
+    
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            response = await client.post(
+                endpoint,
+                json=body,
+                headers=headers,
+                timeout=BATCH_SCAN_TIMEOUT,
+            )
+            
+            if response.status_code == 200:
+                break  # Success
+            
+            # Non-200: retry on 5xx, fail on 4xx
+            if response.status_code >= 500 and attempt < MAX_ATTEMPTS:
+                jitter = random.uniform(0.1, 0.5)
+                logger.info(f"[SECURITY] Batch scan HTTP {response.status_code}, retry {attempt}/{MAX_ATTEMPTS-1} after {jitter:.2f}s")
+                await asyncio.sleep(jitter)
+                continue
+            else:
+                # 4xx or final attempt
+                last_exception = f"HTTP_{response.status_code}"
+                break
+                
+        except (asyncio.TimeoutError, httpx.TimeoutException) as e:
+            if attempt < MAX_ATTEMPTS:
+                jitter = random.uniform(0.1, 0.5)
+                logger.info(f"[SECURITY] Batch scan timeout, retry {attempt}/{MAX_ATTEMPTS-1} after {jitter:.2f}s")
+                await asyncio.sleep(jitter)
+                last_exception = "TIMEOUT"
+            else:
+                last_exception = "TIMEOUT"
+                break
+        except Exception as e:
+            logger.error(f"[SECURITY] Batch scan exception: {type(e).__name__}: {e}")
+            last_exception = type(e).__name__
+            break
+    
+    # Step 5: Parse response
+    if response and response.status_code == 200:
+        try:
+            data = response.json()
+            matches = data.get("matches", [])
+            
+            # Build URL->threat map
+            threat_map = {}
+            for match in matches:
+                url = match.get("threat", {}).get("url")
+                threat_type = match.get("threatType", "UNKNOWN")
+                if url:
+                    threat_map[url] = threat_type
+            
+            # Assign verdicts
+            for url in uncached_urls:
+                if url in threat_map:
+                    # Threat confirmed
+                    is_safe = 0
+                    threat_type = threat_map[url]
+                    logger.info(f"[SECURITY] UNSAFE: {url[:60]} - {threat_type}")
+                else:
+                    # No match = safe
+                    is_safe = 1
+                    threat_type = None
+                
+                results[url] = {
+                    "url": url,
+                    "is_safe": is_safe,
+                    "threat_type": threat_type,
+                    "scan_failed": False
+                }
+                
+                # Cache verdicts (not failures)
+                async with _cache_lock:
+                    URL_SAFETY_CACHE[url] = (is_safe, threat_type)
+                await asyncio.to_thread(save_url_result, email_id, url, is_safe, threat_type)
+            
+            logger.info(f"[SECURITY] Batch scan OK: {len(uncached_urls)} URLs, {len(threat_map)} threats")
+            
+        except Exception as e:
+            logger.error(f"[SECURITY] Failed to parse batch response: {e}")
+            # Treat as scan_failed for all uncached URLs
+            for url in uncached_urls:
+                results[url] = {
+                    "url": url,
+                    "is_safe": None,
+                    "threat_type": None,
+                    "scan_failed": True
+                }
+    else:
+        # API call failed
+        logger.error(f"[SECURITY] Batch scan failed: {last_exception}")
+        for url in uncached_urls:
+            results[url] = {
+                "url": url,
+                "is_safe": None,
+                "threat_type": None,
+                "scan_failed": True
+            }
+    
+    return results
 
 
 async def scan_url(url: str, email_id: str,

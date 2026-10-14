@@ -1321,10 +1321,12 @@ async def security_scan_email(request: Request, user: dict = Depends(require_aut
     urls = extract_urls(body)
     threats = []
     
-    api_semaphore = asyncio.Semaphore(10)
+    # Phase 3 Task 10: Batch URL scanning
     async with httpx.AsyncClient(timeout=10.0) as client:
-        for url in urls:
-            result = await scan_url(url, email_id, client, api_semaphore)
+        from security import scan_urls_batch
+        scan_results_dict = await scan_urls_batch(urls, email_id, client)
+        
+        for url, result in scan_results_dict.items():
             if result["is_safe"] == 0:
                 threats.append(result)
 
@@ -1441,14 +1443,15 @@ async def reanalyze_scam_email(
     url_threat_confirmed = False
     url_scan_unavailable = False
     
+    # Phase 3 Task 10: Batch URL scanning (single API request)
     if urls:
         async with httpx.AsyncClient(timeout=10.0) as url_client:
-            url_semaphore = asyncio.Semaphore(10)
-            scan_tasks = [scan_url(url, email_id, url_client, url_semaphore) for url in urls]
-            results = await asyncio.gather(*scan_tasks)
+            from security import scan_urls_batch
+            scan_results_dict = await scan_urls_batch(urls, email_id, url_client)
             
+            # Phase 3 Task 11: URL scan failures do NOT downgrade analysis_status
             # Separate real threats (is_safe=0, threat_type set) from scan failures (is_safe=None or scan_failed=True)
-            for r in results:
+            for url, r in scan_results_dict.items():
                 if r.get("is_safe") == 0 and r.get("threat_type") is not None:
                     url_threat_confirmed = True  # API confirmed real threat
                 elif r.get("scan_failed") or r.get("is_safe") is None:

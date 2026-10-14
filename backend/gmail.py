@@ -1045,20 +1045,25 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                         status="fetched", received_at=received_at, analysis_status="pending")
 
             # Phase 1 Task 4: Offload HTML parsing (BeautifulSoup) to thread pool
+            # Phase 3 Task 10: Batch URL scanning (single Safe Browsing API call)
             urls = list(dict.fromkeys(await asyncio.to_thread(extract_urls, body)))
             urls_total = len(urls)
             selected_urls = urls[:MAX_URLS_SCANNED]
-            scan_results = await asyncio.gather(*[
-                scan_url(url, email_id, url_client, url_semaphore) for url in selected_urls
-            ], return_exceptions=True)
-            url_scan_unavailable = len(selected_urls) < urls_total
-            for result in scan_results:
-                if isinstance(result, BaseException) or result.get("scan_failed") or result.get("is_safe") is None:
+            
+            # Batch scan all URLs in one request (replaces gather + per-URL calls)
+            from security import scan_urls_batch
+            scan_results_dict = await scan_urls_batch(selected_urls, email_id, url_client)
+            
+            # Phase 3 Task 11: URL scan failures do NOT downgrade analysis_status
+            url_scan_unavailable = len(selected_urls) < urls_total  # capped URLs
+            for url, result in scan_results_dict.items():
+                if result.get("scan_failed") or result.get("is_safe") is None:
                     url_scan_unavailable = True
                     continue
                 urls_checked += 1
                 if result.get("is_safe") == 0 and result.get("threat_type"):
                     url_threat_confirmed = True
+            
             url_scan_status = (
                 "threat_detected" if url_threat_confirmed else
                 "not_applicable" if not urls_total else
@@ -1198,8 +1203,9 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             if analysis_status == "complete":
                 analysis_status = "completed"
             
-            # Downgrade to partial if incomplete conditions exist
-            if url_scan_unavailable or label_id is None:
+            # Phase 3 Task 11: URL scan failures do NOT downgrade analysis_status
+            # Downgrade to partial only if AI/category analysis incomplete OR label resolution failed
+            if label_id is None:
                 analysis_status = "partial"
             decision = routed.get("routing_decision", "unknown")
             v2_score = routed.get("v2_score")
