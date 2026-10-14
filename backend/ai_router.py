@@ -88,6 +88,7 @@ NVIDIA_MODEL = _usable_secret(os.getenv("NVIDIA_MODEL"))
 # Gemini API (secondary) - scalar key followed by 17 rotating keys
 GEMINI_API_KEYS = _load_key_pool("GEMINI_API_KEY", 17)
 GEMINI_API_KEY = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else None
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 
 def get_provider_status() -> dict[str, dict[str, bool | int]]:
@@ -673,7 +674,7 @@ class AIRouter:
             key = GEMINI_API_KEYS[(start_index + offset) % len(GEMINI_API_KEYS)]
 
             # SEC-004 fix: API key in header, not URL query string
-            url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
             headers = {
                 "Content-Type": "application/json",
                 "x-goog-api-key": key,
