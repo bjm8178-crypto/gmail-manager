@@ -106,6 +106,7 @@ def test_numbered_provider_status_counts_scalar_and_numbered_keys():
     status = ast.literal_eval(result.stdout.strip().splitlines()[-1])
     assert status["groq"] == {"configured": True, "key_count": 2}
     assert status["gemini"] == {"configured": True, "key_count": 2}
+    assert status["cloudflare"] == {"configured": False}
 
 
 def test_gemini_retries_remaining_keys_after_quota_response(monkeypatch):

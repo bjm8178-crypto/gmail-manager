@@ -97,6 +97,7 @@ def get_provider_status() -> dict[str, dict[str, bool | int]]:
         "groq": {"configured": bool(GROQ_API_KEYS), "key_count": len(GROQ_API_KEYS)},
         "gemini": {"configured": bool(GEMINI_API_KEYS), "key_count": len(GEMINI_API_KEYS)},
         "cohere": {"configured": bool(COHERE_API_KEY)},
+        "cloudflare": {"configured": bool(CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN)},
         "breaker_open": AI_BREAKER.snapshot(),
         "safebrowsing": {"configured": bool(GOOGLE_SAFE_BROWSING_KEY)},
     }
@@ -107,9 +108,10 @@ COHERE_API_KEY = _usable_secret(os.getenv("COHERE_API_KEY"))
 # OpenRouter API (quinary — free auto-router)
 OPENROUTER_API_KEY = _usable_secret(os.getenv("OPENROUTER_API_KEY"))
 
-# Cloudflare Workers AI (free: 10K neurons/day, Llama 3.3 70B FP8 Fast)
+# Cloudflare Workers AI (GLM-4.7-Flash)
 CLOUDFLARE_ACCOUNT_ID = _usable_secret(os.getenv("CLOUDFLARE_ACCOUNT_ID"))
 CLOUDFLARE_API_TOKEN = _usable_secret(os.getenv("CLOUDFLARE_API_TOKEN"))
+CLOUDFLARE_MODEL = os.getenv("CLOUDFLARE_MODEL", "@cf/zai-org/glm-4.7-flash")
 
 # Mistral AI (La Plateforme free tier: ~1 RPS, 500K TPM)
 MISTRAL_API_KEY = _usable_secret(os.getenv("MISTRAL_API_KEY"))
@@ -130,8 +132,8 @@ GOOGLE_SAFE_BROWSING_KEY = _usable_secret(os.getenv("GOOGLE_SAFE_BROWSING_KEY"))
 
 # ---------- PHASE 2: CASCADE CONFIGURATION ----------
 
-# Provider order is env-driven. Default: Groq -> Gemini -> Cohere.
-_DEFAULT_PROVIDER_ORDER = "groq,gemini,cohere"
+# Provider order is env-driven. Default: Groq -> Gemini -> Cohere -> Cloudflare.
+_DEFAULT_PROVIDER_ORDER = "groq,gemini,cohere,cloudflare"
 AI_PROVIDER_ORDER = [
     name.strip().lower()
     for name in os.getenv("AI_PROVIDER_ORDER", _DEFAULT_PROVIDER_ORDER).split(",")
@@ -449,7 +451,8 @@ class AIRouter:
             f"[AI ROUTER] Providers loaded: "
             f"groq={len(GROQ_API_KEYS)} keys, "
             f"gemini={len(GEMINI_API_KEYS)} keys, "
-            f"cohere={bool(COHERE_API_KEY)}"
+            f"cohere={bool(COHERE_API_KEY)}, "
+            f"cloudflare={bool(CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN)}"
         )
         # Phase 2 Task 5: only providers configured at startup enter the cascade.
         self._provider_registry: dict[str, Callable[[str], "asyncio.Future[str]"] ] = {
@@ -874,7 +877,7 @@ class AIRouter:
     # ---------- PROVIDER: CLOUDFLARE WORKERS AI ----------
 
     async def _call_cloudflare(self, prompt: str) -> str:
-        """Call Cloudflare Workers AI (OpenAI-compatible) with Llama 3.3 70B FP8 Fast."""
+        """Call Cloudflare Workers AI (OpenAI-compatible) with GLM-4.7-Flash / configured model."""
         if not (CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN):
             raise ProviderError("Cloudflare account id / token not configured")
 
@@ -887,7 +890,7 @@ class AIRouter:
             "Content-Type": "application/json",
         }
         body = {
-            "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+            "model": CLOUDFLARE_MODEL,
             "messages": [{
                 "role": "system",
                 "content": (

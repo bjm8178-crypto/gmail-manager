@@ -1308,6 +1308,11 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                 
                 # Validate AI response structure
                 scam_score = data.get('scam_score')
+                if scam_score is not None and not isinstance(scam_score, bool):
+                    try:
+                        scam_score = int(round(float(scam_score)))
+                    except (ValueError, TypeError):
+                        pass
                 if not isinstance(scam_score, int) or not 0 <= scam_score <= 100:
                     raise ValueError("Invalid scam_score from AI")
                 
