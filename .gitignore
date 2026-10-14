@@ -68,3 +68,5 @@ coverage.json
 .planning/
 .kilo/
 *.backup
+backend/full_test_run.txt
+backend/test_results.txt
