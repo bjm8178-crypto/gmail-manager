@@ -1331,6 +1331,11 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
 
             label = routed.get("label", "Unknown")
             score = routed.get("scam_score")
+            if score is not None and not isinstance(score, bool):
+                try:
+                    score = int(round(float(score)))
+                except (ValueError, TypeError):
+                    score = None
 
             # Phase 2 Task 9: case-insensitive + fuzzy match against real labels.
             from ai_router import match_label
