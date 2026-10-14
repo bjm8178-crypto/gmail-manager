@@ -94,17 +94,9 @@ def get_provider_status() -> dict[str, dict[str, bool | int]]:
     """Return provider configuration using the same normalized credentials."""
     return {
         "groq": {"configured": bool(GROQ_API_KEYS), "key_count": len(GROQ_API_KEYS)},
-        "nvidia": {"configured": bool(NVIDIA_API_KEY)},
         "gemini": {"configured": bool(GEMINI_API_KEYS), "key_count": len(GEMINI_API_KEYS)},
         "cohere": {"configured": bool(COHERE_API_KEY)},
-        "openrouter": {"configured": bool(OPENROUTER_API_KEY)},
-        "cloudflare": {"configured": bool(CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN)},
-        "mistral": {"configured": bool(MISTRAL_API_KEY)},
-        "zai": {"configured": bool(ZAI_API_KEY)},
-        "llm7": {"configured": ENABLE_LLM7},
-        "kilo": {"configured": ENABLE_KILO},
         "breaker_open": AI_BREAKER.snapshot(),
-        "ovh": {"configured": True},
         "safebrowsing": {"configured": bool(GOOGLE_SAFE_BROWSING_KEY)},
     }
 
@@ -137,8 +129,8 @@ GOOGLE_SAFE_BROWSING_KEY = _usable_secret(os.getenv("GOOGLE_SAFE_BROWSING_KEY"))
 
 # ---------- PHASE 2: CASCADE CONFIGURATION ----------
 
-# Provider order is env-driven. Default: Groq -> Gemini -> Cohere -> OVH.
-_DEFAULT_PROVIDER_ORDER = "groq,gemini,cohere,ovh"
+# Provider order is env-driven. Default: Groq -> Gemini -> Cohere.
+_DEFAULT_PROVIDER_ORDER = "groq,gemini,cohere"
 AI_PROVIDER_ORDER = [
     name.strip().lower()
     for name in os.getenv("AI_PROVIDER_ORDER", _DEFAULT_PROVIDER_ORDER).split(",")
@@ -455,16 +447,8 @@ class AIRouter:
         logger.info(
             f"[AI ROUTER] Providers loaded: "
             f"groq={len(GROQ_API_KEYS)} keys, "
-            f"cloudflare={bool(CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN)}, "
-            f"mistral={bool(MISTRAL_API_KEY)}, "
-            f"gemini={bool(GEMINI_API_KEYS)}, "
-            f"cohere={bool(COHERE_API_KEY)}, "
-            f"zai={bool(ZAI_API_KEY)}, "
-            f"nvidia={bool(NVIDIA_API_KEY and NVIDIA_MODEL)}, "
-            f"openrouter={bool(OPENROUTER_API_KEY)}, "
-            f"llm7={'enabled' if ENABLE_LLM7 else 'disabled'}, "
-            f"kilo={'enabled' if ENABLE_KILO else 'disabled'}, "
-            f"ovh=keyless"
+            f"gemini={len(GEMINI_API_KEYS)} keys, "
+            f"cohere={bool(COHERE_API_KEY)}"
         )
         # Phase 2 Task 5: only providers configured at startup enter the cascade.
         self._provider_registry: dict[str, Callable[[str], "asyncio.Future[str]"] ] = {
