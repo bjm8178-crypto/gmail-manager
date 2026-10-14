@@ -124,6 +124,25 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn('Confirmed malicious URL', result['scam_indicators'])
                 self.assertEqual(result['routing_decision'], 'url_threat_override')
 
+    async def test_ml_circuit_breaker_opens_after_n_failures_and_bypasses_model(self):
+        self.router.reset_ml_circuit_breaker()
+        self.router.predict_email.side_effect = RuntimeError("Broken model tensor")
+        
+        # 3 failures should trip the breaker (ML_MAX_FAILURES=3)
+        for _ in range(3):
+            result = await self.route()
+            self.assertIsNone(result['v2_score'])
+        
+        self.assertTrue(self.router.is_ml_breaker_open())
+        self.assertEqual(self.router.predict_email.call_count, 3)
+
+        # 4th call should bypass predict_email completely (costs 0ms, no call)
+        result4 = await self.route()
+        self.assertIsNone(result4['v2_score'])
+        self.assertEqual(self.router.predict_email.call_count, 3)
+        self.router.reset_ml_circuit_breaker()
+
 
 if __name__ == '__main__':
     unittest.main()
+

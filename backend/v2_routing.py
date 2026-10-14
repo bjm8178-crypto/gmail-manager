@@ -30,6 +30,60 @@ except Exception:
     logger.warning('[V2_ROUTER] Local model unavailable')
 
 
+# Phase 5 Task 15: Local ML Circuit Breaker
+# If local ML fails on N calls, open breaker so broken model costs 0ms per email
+ML_MAX_FAILURES = int(os.getenv("ML_MAX_FAILURES", "3"))
+_ml_failure_count = 0
+_ml_breaker_open = False
+_ml_traceback_logged = False
+
+
+def reset_ml_circuit_breaker():
+    """Reset ML circuit breaker state (useful for tests or after model reload)."""
+    global _ml_failure_count, _ml_breaker_open, _ml_traceback_logged
+    _ml_failure_count = 0
+    _ml_breaker_open = False
+    _ml_traceback_logged = False
+
+
+def is_ml_breaker_open() -> bool:
+    """Return whether the ML circuit breaker is open."""
+    return _ml_breaker_open
+
+
+def _record_ml_failure(exc: Exception):
+    global _ml_failure_count, _ml_breaker_open, _ml_traceback_logged
+    _ml_failure_count += 1
+    if not _ml_traceback_logged:
+        import traceback
+        logger.error(
+            "[V2_ROUTER] Local ML prediction failed (first failure, full traceback):\n%s",
+            traceback.format_exc(),
+        )
+        _ml_traceback_logged = True
+    else:
+        logger.warning(
+            "[V2_ROUTER] Local prediction failed (%d/%d): %s: %s",
+            _ml_failure_count,
+            ML_MAX_FAILURES,
+            type(exc).__name__,
+            str(exc)[:200],
+        )
+
+    if _ml_failure_count >= ML_MAX_FAILURES and not _ml_breaker_open:
+        _ml_breaker_open = True
+        logger.error(
+            "[V2_ROUTER] Local ML circuit breaker OPEN after %d failures; "
+            "bypassing local ML (costs 0ms per email)",
+            _ml_failure_count,
+        )
+
+
+def _record_ml_success():
+    global _ml_failure_count
+    _ml_failure_count = 0
+
+
 class AnalysisUnavailableError(RuntimeError):
     """No risk verdict is available; ``result`` retains any partial category/evidence."""
 
@@ -59,7 +113,9 @@ async def route_email_with_v2(
         'url_scan_unavailable': bool(url_scan_unavailable),
     }
     score = None
-    if V2_AVAILABLE:
+    t_ml = 0.0
+    if V2_AVAILABLE and not _ml_breaker_open:
+        t_ml_start = asyncio.get_event_loop().time()
         try:
             prediction = await asyncio.to_thread(predict_email, subject, body, sender)
             candidate = prediction['probabilities']['phishing']
@@ -67,9 +123,13 @@ async def route_email_with_v2(
                 raise ValueError('Invalid phishing probability')
             score = float(candidate)
             response['v2_score'] = score
+            _record_ml_success()
         except Exception as e:
-            logger.warning('[V2_ROUTER] Local prediction failed: %s: %s', type(e).__name__, str(e)[:200])
+            _record_ml_failure(e)
+        finally:
+            t_ml = asyncio.get_event_loop().time() - t_ml_start
 
+    t_ai_start = asyncio.get_event_loop().time()
     try:
         ai_result = await ai_cascade_func()
     except Exception as e:
@@ -81,6 +141,10 @@ async def route_email_with_v2(
             provider_info
         )
         ai_result = {}
+    finally:
+        t_ai = asyncio.get_event_loop().time() - t_ai_start
+
+    response['timings'] = {'ml': t_ml, 'ai': t_ai}
     
     if not isinstance(ai_result, dict):
         logger.warning('[V2_ROUTER] AI result not a dict: got %s', type(ai_result).__name__)
