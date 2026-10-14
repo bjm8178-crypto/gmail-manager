@@ -67,6 +67,7 @@ coverage.json
 # Development artifacts
 .planning/
 .kilo/
+.omh/
 *.backup
 backend/full_test_run.txt
 backend/test_results.txt
