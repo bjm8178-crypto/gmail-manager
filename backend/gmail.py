@@ -975,21 +975,32 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                        available_label_names: list[str],
                        gmail_labels_cache: dict[str, str],
                        update_mode: bool = False) -> dict:
-    """Persist a suggestion and its evidence; Gmail changes require explicit approval."""
+    """
+    Persist a suggestion and its evidence; Gmail changes require explicit approval.
+    Phase 1 Task 2: Track in-flight emails to prevent concurrent analysis.
+    """
     from security import extract_urls, scan_url
     from database import update_analyzed_email
+    from job_lock import register_inflight_email, unregister_inflight_email
 
-    async with semaphore:
-        email_id = email["id"]
-        subject = email.get("subject", "(No Subject)")
-        sender = email.get("sender", "(Unknown)")
-        body = email.get("body", "")
-        snippet = email.get("snippet", "")
-        received_at = email.get("received_at")
-        url_threat_confirmed = False
-        urls_total = urls_checked = 0
-        url_scan_status = "unavailable"
-        base = {"email_id": email_id, "subject": subject, "sender": sender}
+    email_id = email["id"]
+    subject = email.get("subject", "(No Subject)")
+    sender = email.get("sender", "(Unknown)")
+    base = {"email_id": email_id, "subject": subject, "sender": sender}
+
+    # Phase 1 Task 2: Skip if already in-flight
+    if not await register_inflight_email(user_id, email_id):
+        logger.info(f"[JOB_LOCK] Skipping {email_id}: already in-flight")
+        return {**base, "status": "skipped", "label": "", "scam_score": None, "is_quarantined": 0}
+
+    try:
+        async with semaphore:
+            body = email.get("body", "")
+            snippet = email.get("snippet", "")
+            received_at = email.get("received_at")
+            url_threat_confirmed = False
+            urls_total = urls_checked = 0
+            url_scan_status = "unavailable"
 
         def persist(**values):
             if update_mode:
@@ -1200,6 +1211,9 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             return {**base, "label": "Unknown", "scam_score": score,
                     "is_quarantined": int(url_threat_confirmed), "status": "failed",
                     "analysis_status": "failed", "error": "Analysis unavailable — retry."}
+    finally:
+        # Phase 1 Task 2: Always cleanup in-flight tracking
+        await unregister_inflight_email(user_id, email_id)
 
 
 

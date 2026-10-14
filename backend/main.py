@@ -54,6 +54,11 @@ from database import (
     get_user_email_by_id,
     _get_connection, _execute, _release_connection,
 )
+from job_lock import (
+    acquire_user_job_lock, release_user_job_lock,
+    register_inflight_email, unregister_inflight_email,
+    clear_user_inflight_emails, get_job_lock_status,
+)
 from ml_inference import load_active_model
 from ai_router import ai_router, REWRITE_PROMPT, CLASSIFICATION_PROMPT, get_provider_status
 from dependencies import require_auth
@@ -612,15 +617,27 @@ async def emails_analyze_bulk(request: Request, user: dict = Depends(require_aut
     Runs the AI-only bulk analysis pipeline.
     Streams results back as Server-Sent Events (SSE).
     count: Number of emails to analyze (1-500)
+    Phase 1 Task 2: Acquire per-user job lock to prevent overlapping runs.
     """
 
     limit = min(max(count, 1), 500)  # clamp to prevent AI/Gmail quota exhaustion
     user_id = user["user_id"]
 
+    # Phase 1 Task 2: Acquire job lock (fail fast with 409 if locked)
+    job_lock = await acquire_user_job_lock(user_id, timeout=0.1)
+    if not job_lock:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "job_in_progress",
+                "message": "A bulk analysis or label-only job is already running for your account. Please wait for it to complete."
+            }
+        )
 
     # Item 1: Block analysis if user has zero labels
     user_labels = get_labels(user_id)
     if not user_labels:
+        release_user_job_lock(job_lock)
         return JSONResponse(
             status_code=400,
             content={"error": "no_labels", "message": "You must create at least one label before running analysis. Go to Settings to add labels."}
@@ -629,12 +646,18 @@ async def emails_analyze_bulk(request: Request, user: dict = Depends(require_aut
     from starlette.responses import StreamingResponse
 
     async def sse_stream():
-        async for event in analyze_bulk_ordered(limit=limit, user_id=user_id):
-            event_type = event.get("type", "message")
-            if event_type == "email_done":
-                event_type = "progress"
-            event_data = json.dumps(event)
-            yield f"event: {event_type}\ndata: {event_data}\n\n"
+        try:
+            async for event in analyze_bulk_ordered(limit=limit, user_id=user_id):
+                event_type = event.get("type", "message")
+                if event_type == "email_done":
+                    event_type = "progress"
+                event_data = json.dumps(event)
+                yield f"event: {event_type}\ndata: {event_data}\n\n"
+        finally:
+            # Release lock and clear in-flight tracking when stream ends
+            await clear_user_inflight_emails(user_id)
+            release_user_job_lock(job_lock)
+            logger.info(f"[JOB_LOCK] Released bulk analysis lock for user {user_id}")
 
     return StreamingResponse(
         sse_stream(),
@@ -663,21 +686,40 @@ async def emails_fetch_only(request: Request, user: dict = Depends(require_auth)
 
 @app.post("/emails/label-only")
 async def emails_label_only(request: Request, user: dict = Depends(require_auth), limit: int = None):
-    """POST /emails/label-only - Run AI analysis on status='fetched' emails"""
+    """
+    POST /emails/label-only - Run AI analysis on status='fetched' emails
+    Phase 1 Task 2: Acquire per-user job lock to prevent overlapping runs.
+    """
     user_id = user["user_id"]
 
+    # Phase 1 Task 2: Acquire job lock (fail fast with 409 if locked)
+    job_lock = await acquire_user_job_lock(user_id, timeout=0.1)
+    if not job_lock:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "job_in_progress",
+                "message": "A bulk analysis or label-only job is already running for your account. Please wait for it to complete."
+            }
+        )
     
     user_labels = get_labels(user_id)
     if not user_labels:
+        release_user_job_lock(job_lock)
         return JSONResponse(status_code=400, content={"error": "no_labels"})
     
     from gmail import label_only_pipeline
     
-    final_event = {"analyzed": 0, "failed": 0}
-    async for event in label_only_pipeline(limit=limit, user_id=user_id):
-        final_event = event
-    
-    return JSONResponse(content=final_event)
+    try:
+        final_event = {"analyzed": 0, "failed": 0}
+        async for event in label_only_pipeline(limit=limit, user_id=user_id):
+            final_event = event
+        
+        return JSONResponse(content=final_event)
+    finally:
+        await clear_user_inflight_emails(user_id)
+        release_user_job_lock(job_lock)
+        logger.info(f"[JOB_LOCK] Released label-only lock for user {user_id}")
 
 
 
@@ -1598,8 +1640,20 @@ async def retry_failed_emails(request: Request, user: dict = Depends(require_aut
     """
     POST /emails/retry-failed — Retry failed analysis records through the analysis pipeline.
     P0-4 fix: Pass exact email IDs to label_only_pipeline instead of using limit.
+    Phase 1 Task 2: Acquire per-user job lock to prevent overlapping runs.
     """
     user_id = user["user_id"]
+
+    # Phase 1 Task 2: Acquire job lock (fail fast with 409 if locked)
+    job_lock = await acquire_user_job_lock(user_id, timeout=0.1)
+    if not job_lock:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "job_in_progress",
+                "message": "A bulk analysis or label-only job is already running for your account. Please wait for it to complete."
+            }
+        )
 
     try:
         from database import get_pending_retry_queue
@@ -1642,6 +1696,10 @@ async def retry_failed_emails(request: Request, user: dict = Depends(require_aut
     except Exception as e:
         logger.error(f"[RETRY ERROR] {type(e).__name__}: {str(e)}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": "Failed to retry emails. Please try again."})
+    finally:
+        await clear_user_inflight_emails(user_id)
+        release_user_job_lock(job_lock)
+        logger.info(f"[JOB_LOCK] Released retry-failed lock for user {user_id}")
 
 
 @app.get("/emails/stats")
