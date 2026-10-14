@@ -808,7 +808,8 @@ async def analyze_bulk_ordered(limit: int = 50, user_id: int = None, user_email:
 
     semaphore = asyncio.Semaphore(2)
     url_semaphore = asyncio.Semaphore(8)
-    service = get_gmail_service(user_email)
+    # Phase 1 Task 4: Offload blocking service build to thread pool
+    service = await asyncio.to_thread(get_gmail_service, user_email)
     if not service or user_id is None:
         yield {
             "type": "complete",
@@ -1003,25 +1004,29 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             url_scan_status = "unavailable"
 
         def persist(**values):
-            # Phase 1 Task 3: Enable transactional retry queue removal for success writes
+            # Phase 1 Task 4: Enable transactional retry queue removal for success writes
             remove_retry = values.get('status') == 'labeled'
             if update_mode:
-                update_analyzed_email(email_id=email_id, user_id=user_id, remove_from_retry=remove_retry, **values)
+                # Phase 1 Task 4: Offload blocking DB update to thread pool
+                return asyncio.to_thread(update_analyzed_email, email_id=email_id, user_id=user_id, remove_from_retry=remove_retry, **values)
             else:
-                save_analyzed_email(email_id=email_id, user_id=user_id, snippet=snippet,
+                # Phase 1 Task 4: Offload blocking DB save to thread pool
+                return asyncio.to_thread(save_analyzed_email, email_id=email_id, user_id=user_id, snippet=snippet,
                                     sender=sender, subject=subject, body=body, remove_from_retry=remove_retry, **values)
 
         try:
-            if not update_mode and is_already_analyzed(email_id, user_id):
+            # Phase 1 Task 4: Offload blocking DB check to thread pool
+            if not update_mode and await asyncio.to_thread(is_already_analyzed, email_id, user_id):
                 return {**base, "status": "skipped", "label": "", "scam_score": None, "is_quarantined": 0}
             if not body:
                 # Build a thread-local service: httplib2 transports cannot be shared by workers.
-                service = get_gmail_service(user_email)
+                # Phase 1 Task 4: Offload blocking service build to thread pool
+                service = await asyncio.to_thread(get_gmail_service, user_email)
                 body = await asyncio.to_thread(_get_email_body, service, email_id)
 
             # URL cache rows reference analyzed_emails. Pending never means analyzed.
             if not update_mode:
-                persist(label_id=None, scam_score=None, scam_indicators="[]", is_quarantined=0,
+                await persist(label_id=None, scam_score=None, scam_indicators="[]", is_quarantined=0,
                         status="fetched", received_at=received_at, analysis_status="pending")
 
             urls = list(dict.fromkeys(extract_urls(body)))
@@ -1176,7 +1181,7 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             # Apply consolidated quarantine policy
             from quarantine_policy import should_quarantine
             quarantine = int(should_quarantine(score, url_threat_confirmed, label))
-            persist(
+            await persist(
                 label_id=label_id, scam_score=score, scam_indicators=json.dumps(indicators),
                 is_quarantined=quarantine, status="labeled",
                 source="v2" if decision.startswith("v2_") else "ai", ml_confidence=None,
@@ -1202,12 +1207,13 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             score = 95 if url_threat_confirmed else None
             indicators = ["Known malicious link detected"] if url_threat_confirmed else []
             try:
-                persist(label_id=None, scam_score=score, scam_indicators=json.dumps(indicators),
+                await persist(label_id=None, scam_score=score, scam_indicators=json.dumps(indicators),
                         is_quarantined=int(url_threat_confirmed), status="failed", source=None,
                         analysis_status="failed", category_status="unavailable",
                         url_scan_status=url_scan_status, urls_total=urls_total, urls_checked=urls_checked,
                         received_at=received_at)
-                add_to_retry_queue(email_id, user_id, "Analysis unavailable; retry required")
+                # Phase 1 Task 4: Offload blocking retry queue insert to thread pool
+                await asyncio.to_thread(add_to_retry_queue, email_id, user_id, "Analysis unavailable; retry required")
             except Exception as save_error:
                 logger.error("[PIPELINE] Could not persist failure: %s", type(save_error).__name__)
             return {**base, "label": "Unknown", "scam_score": score,
@@ -1236,7 +1242,8 @@ async def fetch_only_pipeline(limit: int = 50, user_id: int = None, user_email: 
     if user_email is None and user_id is not None:
         user_email = get_user_email_by_id(user_id)
 
-    service = get_gmail_service(user_email)
+    # Phase 1 Task 4: Offload blocking service build to thread pool
+    service = await asyncio.to_thread(get_gmail_service, user_email)
     if not service or user_id is None:
         yield {"type": "complete", "fetched": 0, "skipped": 0, "error": "Not authenticated"}
         return
@@ -1299,7 +1306,8 @@ async def label_only_pipeline(limit: int = None, user_id: int = None, user_email
 
     semaphore = asyncio.Semaphore(2)
     url_semaphore = asyncio.Semaphore(8)
-    service = get_gmail_service(user_email)
+    # Phase 1 Task 4: Offload blocking service build to thread pool
+    service = await asyncio.to_thread(get_gmail_service, user_email)
 
     if not service or user_id is None:
         yield {"type": "complete", "analyzed": 0, "failed": 0, "error": "Not authenticated"}
