@@ -105,11 +105,10 @@ class RouterToGmailContractTests(unittest.IsolatedAsyncioTestCase):
         }
         saved = await self.analyze()
         self.assertEqual(saved['url_scan_status'], 'partial')
-        # Phase 3 Task 11: URL scan failures do NOT downgrade analysis_status
-        # analysis_status is still 'partial' in this test, but that's because the test uses
-        # AI-only fallback (V2_AVAILABLE=False), which returns analysis_status='partial' regardless of URL scan.
-        # The key assertion is that url_scan_status='partial' is ISOLATED from analysis_status.
-        self.assertEqual(saved['analysis_status'], 'partial')  # AI-only fallback
+        # Phase 4 Task 12: analysis_status='completed' iff score AND label exist (regardless of ML/URL)
+        # This test has valid scam_score (from AI) and valid label_id (mocked as 4)
+        # URL scan failure isolated to url_scan_status, does NOT affect analysis_status
+        self.assertEqual(saved['analysis_status'], 'completed')  # Score + label exist
 
 
 if __name__ == '__main__':

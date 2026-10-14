@@ -933,6 +933,90 @@ async def analyze_bulk_ordered(limit: int = 50, user_id: int = None, user_email:
             # Final summary
             analyzed_count = sum(1 for r in all_results if r["status"] == "success")
 
+            # Phase 4 Task 13: Auto-repair pass for failed/partial/Unknown emails
+            # Re-run up to 2 times with backoff, inside same job, NOT counted against rate limit
+            repair_candidates = []
+            for result in all_results:
+                email_id = result.get("email_id")
+                status = result.get("status")
+                analysis_status = result.get("analysis_status")
+                label = result.get("label")
+                
+                # Eligible: failed, partial, or Unknown label
+                if status == "failed" or analysis_status == "partial" or label == "Unknown":
+                    repair_candidates.append(email_id)
+            
+            repair_resolved = []
+            repair_unresolved = []
+            
+            if repair_candidates:
+                logger.info(f"[AUTO-REPAIR] {len(repair_candidates)} emails eligible for repair")
+                yield {
+                    "type": "repair_started",
+                    "count": len(repair_candidates),
+                }
+                
+                # Up to 2 retry attempts with exponential backoff (5s, 15s)
+                for attempt in range(1, 3):
+                    if not repair_candidates:
+                        break
+                    
+                    backoff = 5 * (3 ** (attempt - 1))
+                    logger.info(f"[AUTO-REPAIR] Attempt {attempt}/2 after {backoff}s backoff")
+                    await asyncio.sleep(backoff)
+                    
+                    # Re-analyze each candidate
+                    repair_tasks = []
+                    for email_id in repair_candidates:
+                        original = next((e for e in new_emails if e["id"] == email_id), None)
+                        if original:
+                            repair_tasks.append(
+                                asyncio.create_task(_analyze_one(
+                                    email=original,
+                                    semaphore=semaphore,
+                                    ai_router=ai_router,
+                                    classification_prompt=CLASSIFICATION_PROMPT,
+                                    user_id=user_id,
+                                    user_email=user_email,
+                                    service=service,
+                                    url_client=url_client,
+                                    url_semaphore=url_semaphore,
+                                    available_label_names=available_label_names,
+                                    gmail_labels_cache=gmail_labels_cache,
+                                ))
+                            )
+                    
+                    repair_results = await asyncio.gather(*repair_tasks, return_exceptions=True)
+                    
+                    # Check which resolved
+                    still_broken = []
+                    for i, res in enumerate(repair_results):
+                        eid = repair_candidates[i]
+                        if isinstance(res, Exception):
+                            still_broken.append(eid)
+                            continue
+                        
+                        st = res.get("status")
+                        ast = res.get("analysis_status")
+                        lbl = res.get("label")
+                        
+                        if st == "failed" or ast == "partial" or lbl == "Unknown":
+                            still_broken.append(eid)
+                        else:
+                            repair_resolved.append(eid)
+                    
+                    repair_candidates = still_broken
+                
+                repair_unresolved = repair_candidates
+                logger.info(f"[AUTO-REPAIR] Complete: {len(repair_resolved)} resolved, {len(repair_unresolved)} unresolved")
+                
+                yield {
+                    "type": "repair_complete",
+                    "resolved": len(repair_resolved),
+                    "unresolved": len(repair_unresolved),
+                    "unresolved_ids": repair_unresolved[:10],
+                }
+
             t_bulk_total = time.perf_counter() - t_bulk_start
             logger.info(f"[TIMING] BULK COMPLETE: total_time={t_bulk_total:.2f}s analyzed={analyzed_count} "
                   f"skipped={skipped_count} failed={failed_count} "
@@ -1198,15 +1282,15 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                     if "Suspicious attachment detected" not in indicators:
                         indicators = [*indicators, "Suspicious attachment detected"]
             
-            # Map v2_routing's 'complete' to stored 'completed' for consistency
-            analysis_status = routed.get("analysis_status", "completed")
-            if analysis_status == "complete":
-                analysis_status = "completed"
-            
-            # Phase 3 Task 11: URL scan failures do NOT downgrade analysis_status
-            # Downgrade to partial only if AI/category analysis incomplete OR label resolution failed
+            # Phase 4 Task 12: Define analysis_status per new logic
+            # - 'completed' iff valid score AND valid label exist (regardless of ML/URL scan)
+            # - 'partial' only when score exists but label is missing
+            # - 'failed' only when no score (handled in exception block below)
+            # URL scan results do NOT affect analysis_status (Phase 3 Task 11)
             if label_id is None:
-                analysis_status = "partial"
+                analysis_status = "partial"  # Score exists but label resolution failed
+            else:
+                analysis_status = "completed"  # Both score and label exist
             decision = routed.get("routing_decision", "unknown")
             v2_score = routed.get("v2_score")
             provider_used = routed.get("provider_used")
