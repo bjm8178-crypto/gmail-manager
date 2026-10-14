@@ -10,6 +10,7 @@ logger = get_logger(__name__)
 
 import json
 import asyncio
+import time
 import socket
 socket.setdefaulttimeout(15)
 from googleapiclient.discovery import build
@@ -799,7 +800,122 @@ async def _fetch_new_emails(limit: int, user_id: int, user_email: str):
     return new_emails, skipped_count, fetched_count
 
 
-async def analyze_bulk_ordered(limit: int = 50, user_id: int = None, user_email: str = None):
+AUTO_REPAIR_BACKOFF_SECONDS = (5, 15)
+
+
+def _repair_candidate_ids(results: list[dict]) -> list[str]:
+    """Return unique failed/partial/Unknown email IDs in result order."""
+    candidate_ids = []
+    seen = set()
+    for result in results:
+        email_id = result.get("email_id")
+        if not email_id or email_id in seen:
+            continue
+        if (
+            result.get("status") == "failed"
+            or result.get("analysis_status") in {"failed", "partial"}
+            or result.get("label") == "Unknown"
+        ):
+            candidate_ids.append(email_id)
+            seen.add(email_id)
+    return candidate_ids
+
+
+def _repair_succeeded(result: dict) -> bool:
+    """A retry is resolved only when it returns a complete score+label result."""
+    return (
+        result.get("status") == "success"
+        and result.get("analysis_status") == "completed"
+        and result.get("label") not in {None, "", "Unknown"}
+    )
+
+
+async def _auto_repair_results(
+    results: list[dict],
+    emails: list[dict],
+    *,
+    semaphore: asyncio.Semaphore,
+    ai_router,
+    classification_prompt: str,
+    user_id: int,
+    user_email: str,
+    service,
+    url_client: httpx.AsyncClient,
+    url_semaphore: asyncio.Semaphore,
+    available_label_names: list[str],
+    gmail_labels_cache: dict[str, str],
+) -> tuple[list[dict], dict]:
+    """Retry incomplete results twice inside the current bulk job."""
+    attempted_ids = _repair_candidate_ids(results)
+    report = {
+        "attempted": len(attempted_ids),
+        "resolved": 0,
+        "unresolved": len(attempted_ids),
+        "unresolved_ids": attempted_ids.copy(),
+    }
+    if not attempted_ids:
+        return results, report
+
+    emails_by_id = {email.get("id", email.get("email_id")): email for email in emails}
+    latest_by_id = {result.get("email_id"): result for result in results if result.get("email_id")}
+    unresolved_ids = attempted_ids.copy()
+
+    for attempt, backoff in enumerate(AUTO_REPAIR_BACKOFF_SECONDS, start=1):
+        if not unresolved_ids:
+            break
+
+        logger.info(
+            "[AUTO-REPAIR] Attempt %s/%s after %ss backoff",
+            attempt,
+            len(AUTO_REPAIR_BACKOFF_SECONDS),
+            backoff,
+        )
+        await asyncio.sleep(backoff)
+
+        task_ids = [email_id for email_id in unresolved_ids if email_id in emails_by_id]
+        missing_ids = [email_id for email_id in unresolved_ids if email_id not in emails_by_id]
+        repair_results = await asyncio.gather(
+            *[
+                _analyze_one(
+                    email=emails_by_id[email_id],
+                    semaphore=semaphore,
+                    ai_router=ai_router,
+                    classification_prompt=classification_prompt,
+                    user_id=user_id,
+                    user_email=user_email,
+                    service=service,
+                    url_client=url_client,
+                    url_semaphore=url_semaphore,
+                    available_label_names=available_label_names,
+                    gmail_labels_cache=gmail_labels_cache,
+                    update_mode=True,
+                )
+                for email_id in task_ids
+            ],
+            return_exceptions=True,
+        )
+
+        next_unresolved = list(missing_ids)
+        for email_id, result in zip(task_ids, repair_results):
+            if isinstance(result, Exception):
+                next_unresolved.append(email_id)
+                continue
+            latest_by_id[email_id] = result
+            if not _repair_succeeded(result):
+                next_unresolved.append(email_id)
+        unresolved_ids = next_unresolved
+
+    updated_results = [latest_by_id.get(result.get("email_id"), result) for result in results]
+    report = {
+        "attempted": len(attempted_ids),
+        "resolved": len(attempted_ids) - len(unresolved_ids),
+        "unresolved": len(unresolved_ids),
+        "unresolved_ids": unresolved_ids,
+    }
+    return updated_results, report
+
+
+async def analyze_bulk_ordered(limit: int = 50, user_id: int = None, user_email: str = None, run_id: str = None):
     """
     AI-only bulk analysis engine with semaphore-controlled concurrency.
     Yields progress events via SSE as emails finish processing.
@@ -810,11 +926,18 @@ async def analyze_bulk_ordered(limit: int = 50, user_id: int = None, user_email:
         limit: Maximum number of emails to process
         user_id: The authenticated user's ID
         user_email: The authenticated user's gmail_address (used to load their token)
+        run_id: Optional unique identifier for this analysis run
     """
+    import uuid
     from ai_router import ai_router, CLASSIFICATION_PROMPT, ANALYZE_CONCURRENCY
     from security import extract_urls, scan_url
+    from logger_setup import set_log_context, clear_log_context
     import httpx
     import time
+
+    if not run_id:
+        run_id = str(uuid.uuid4())
+    set_log_context(run_id=run_id)
 
     t_bulk_start = time.perf_counter()
 
@@ -832,6 +955,7 @@ async def analyze_bulk_ordered(limit: int = 50, user_id: int = None, user_email:
             "skipped": 0,
             "failed": 0,
             "results": [],
+            "job_id": run_id,
         }
         return
 
@@ -930,106 +1054,57 @@ async def analyze_bulk_ordered(limit: int = 50, user_id: int = None, user_email:
                     "total": total,
                 }
 
-            # Final summary
-            analyzed_count = sum(1 for r in all_results if r["status"] == "success")
-
-            # Phase 4 Task 13: Auto-repair pass for failed/partial/Unknown emails
-            # Re-run up to 2 times with backoff, inside same job, NOT counted against rate limit
-            repair_candidates = []
-            for result in all_results:
-                email_id = result.get("email_id")
-                status = result.get("status")
-                analysis_status = result.get("analysis_status")
-                label = result.get("label")
-                
-                # Eligible: failed, partial, or Unknown label
-                if status == "failed" or analysis_status == "partial" or label == "Unknown":
-                    repair_candidates.append(email_id)
-            
-            repair_resolved = []
-            repair_unresolved = []
-            
+            # Phase 4 Task 13: Auto-repair failed/partial/Unknown results inside this job.
+            repair_candidates = _repair_candidate_ids(all_results)
             if repair_candidates:
-                logger.info(f"[AUTO-REPAIR] {len(repair_candidates)} emails eligible for repair")
-                yield {
-                    "type": "repair_started",
-                    "count": len(repair_candidates),
-                }
-                
-                # Up to 2 retry attempts with exponential backoff (5s, 15s)
-                for attempt in range(1, 3):
-                    if not repair_candidates:
-                        break
-                    
-                    backoff = 5 * (3 ** (attempt - 1))
-                    logger.info(f"[AUTO-REPAIR] Attempt {attempt}/2 after {backoff}s backoff")
-                    await asyncio.sleep(backoff)
-                    
-                    # Re-analyze each candidate
-                    repair_tasks = []
-                    for email_id in repair_candidates:
-                        original = next((e for e in new_emails if e["id"] == email_id), None)
-                        if original:
-                            repair_tasks.append(
-                                asyncio.create_task(_analyze_one(
-                                    email=original,
-                                    semaphore=semaphore,
-                                    ai_router=ai_router,
-                                    classification_prompt=CLASSIFICATION_PROMPT,
-                                    user_id=user_id,
-                                    user_email=user_email,
-                                    service=service,
-                                    url_client=url_client,
-                                    url_semaphore=url_semaphore,
-                                    available_label_names=available_label_names,
-                                    gmail_labels_cache=gmail_labels_cache,
-                                ))
-                            )
-                    
-                    repair_results = await asyncio.gather(*repair_tasks, return_exceptions=True)
-                    
-                    # Check which resolved
-                    still_broken = []
-                    for i, res in enumerate(repair_results):
-                        eid = repair_candidates[i]
-                        if isinstance(res, Exception):
-                            still_broken.append(eid)
-                            continue
-                        
-                        st = res.get("status")
-                        ast = res.get("analysis_status")
-                        lbl = res.get("label")
-                        
-                        if st == "failed" or ast == "partial" or lbl == "Unknown":
-                            still_broken.append(eid)
-                        else:
-                            repair_resolved.append(eid)
-                    
-                    repair_candidates = still_broken
-                
-                repair_unresolved = repair_candidates
-                logger.info(f"[AUTO-REPAIR] Complete: {len(repair_resolved)} resolved, {len(repair_unresolved)} unresolved")
-                
-                yield {
-                    "type": "repair_complete",
-                    "resolved": len(repair_resolved),
-                    "unresolved": len(repair_unresolved),
-                    "unresolved_ids": repair_unresolved[:10],
-                }
+                logger.info("[AUTO-REPAIR] %s emails eligible for repair", len(repair_candidates))
+                yield {"type": "repair_started", "count": len(repair_candidates)}
 
-            t_bulk_total = time.perf_counter() - t_bulk_start
-            logger.info(f"[TIMING] BULK COMPLETE: total_time={t_bulk_total:.2f}s analyzed={analyzed_count} "
-                  f"skipped={skipped_count} failed={failed_count} "
-                  f"(fetched {fetched_count} emails, {len(new_emails)} were new)")
+            all_results, repair_report = await _auto_repair_results(
+                all_results,
+                new_emails,
+                semaphore=semaphore,
+                ai_router=ai_router,
+                classification_prompt=CLASSIFICATION_PROMPT,
+                user_id=user_id,
+                user_email=user_email,
+                service=service,
+                url_client=url_client,
+                url_semaphore=url_semaphore,
+                available_label_names=available_label_names,
+                gmail_labels_cache=gmail_labels_cache,
+            )
 
+            if repair_candidates:
+                logger.info(
+                    "[AUTO-REPAIR] Complete: %s resolved, %s unresolved",
+                    repair_report["resolved"],
+                    repair_report["unresolved"],
+                )
+                yield {"type": "repair_complete", **repair_report}
+
+            # Recompute terminal summary from post-repair results.
+            analyzed_count = sum(1 for result in all_results if result.get("status") == "success")
+            failed_count = sum(1 for result in all_results if result.get("status") == "failed")
             yield {
                 "type": "complete",
                 "analyzed": analyzed_count,
                 "skipped": skipped_count,
                 "failed": failed_count,
                 "results": all_results,
+                "repair": repair_report,
             }
         finally:
+            # Phase 6 Task 17: Always emit [TIMING] BULK COMPLETE in finally block, including cancel
+            t_bulk_total = time.perf_counter() - t_bulk_start
+            final_analyzed = sum(1 for result in all_results if result.get("status") == "success")
+            final_failed = sum(1 for result in all_results if result.get("status") == "failed")
+            logger.info(
+                "[TIMING] BULK COMPLETE: total_time=%.2fs analyzed=%s skipped=%s failed=%s "
+                "(fetched %s emails, %s were new)",
+                t_bulk_total, final_analyzed, skipped_count, final_failed, fetched_count, len(new_emails)
+            )
+
             # Cancel any tasks still in flight (e.g. SSE disconnect injected GeneratorExit)
             # before url_client closes, so they never call client.post() on a closed client.
             for task in tasks:
@@ -1093,6 +1168,11 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
         logger.info(f"[JOB_LOCK] Skipping {email_id}: already in-flight")
         return {**base, "status": "skipped", "label": "", "scam_score": None, "is_quarantined": 0}
 
+    from logger_setup import set_log_context, clear_log_context
+    set_log_context(email_id=email_id)
+    t_email_start = time.perf_counter()
+    t_body = t_url = t_ml = t_ai = t_db = 0.0
+
     try:
         async with semaphore:
             body = email.get("body", "")
@@ -1118,10 +1198,12 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             if not update_mode and await asyncio.to_thread(is_already_analyzed, email_id, user_id):
                 return {**base, "status": "skipped", "label": "", "scam_score": None, "is_quarantined": 0}
             if not body:
+                t_body_start = time.perf_counter()
                 # Build a thread-local service: httplib2 transports cannot be shared by workers.
                 # Phase 1 Task 4: Offload blocking service build to thread pool
                 service = await asyncio.to_thread(get_gmail_service, user_email)
                 body = await asyncio.to_thread(_get_email_body, service, email_id)
+                t_body = time.perf_counter() - t_body_start
 
             # URL cache rows reference analyzed_emails. Pending never means analyzed.
             if not update_mode:
@@ -1130,6 +1212,7 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
 
             # Phase 1 Task 4: Offload HTML parsing (BeautifulSoup) to thread pool
             # Phase 3 Task 10: Batch URL scanning (single Safe Browsing API call)
+            t_url_start = time.perf_counter()
             urls = list(dict.fromkeys(await asyncio.to_thread(extract_urls, body)))
             urls_total = len(urls)
             selected_urls = urls[:MAX_URLS_SCANNED]
@@ -1137,6 +1220,7 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             # Batch scan all URLs in one request (replaces gather + per-URL calls)
             from security import scan_urls_batch
             scan_results_dict = await scan_urls_batch(selected_urls, email_id, url_client)
+            t_url = time.perf_counter() - t_url_start
             
             # Phase 3 Task 11: URL scan failures do NOT downgrade analysis_status
             url_scan_unavailable = len(selected_urls) < urls_total  # capped URLs
@@ -1241,6 +1325,10 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                     'url_scan_unavailable': url_scan_unavailable,
                 }
 
+            timings = routed.get("timings", {})
+            t_ml = timings.get("ml", 0.0)
+            t_ai = timings.get("ai", 0.0)
+
             label = routed.get("label", "Unknown")
             score = routed.get("scam_score")
 
@@ -1299,6 +1387,7 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             # Apply consolidated quarantine policy
             from quarantine_policy import should_quarantine
             quarantine = int(should_quarantine(score, url_threat_confirmed, label))
+            t_db_start = time.perf_counter()
             await persist(
                 label_id=label_id, scam_score=score, scam_indicators=json.dumps(indicators),
                 is_quarantined=quarantine, status="labeled",
@@ -1311,6 +1400,24 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                 attachment_risk=attachment_verdict,  # Phase 5: clean, suspicious, malicious
                 attachment_details=attachment_details,  # Phase 5: JSON scan results
             )
+            t_db = time.perf_counter() - t_db_start
+            t_total = time.perf_counter() - t_email_start
+
+            # Phase 6 Task 18: Completion log with per-stage timings
+            logger.info(
+                "[PIPELINE] Complete %s: status=%s score=%s label=%s (timings: gmail_body=%.2fs url_scan=%.2fs ml=%.2fs ai=%.2fs db=%.2fs total=%.2fs)",
+                email_id[:12],
+                analysis_status,
+                score,
+                label,
+                t_body,
+                t_url,
+                t_ml,
+                t_ai,
+                t_db,
+                t_total,
+            )
+
             # Phase 1 Task 3: Retry queue removal now handled in persist() transaction
             return {**base, "label": label, "scam_score": score, "is_quarantined": quarantine,
                     "status": "success", "analysis_status": analysis_status,
@@ -1324,22 +1431,27 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             # Preserve confirmed external evidence even if later processing fails.
             score = 95 if url_threat_confirmed else None
             indicators = ["Known malicious link detected"] if url_threat_confirmed else []
+            # Phase 4 Task 12: 'partial' when score exists but label is missing; 'failed' only when no score
+            failure_analysis_status = "partial" if score is not None else "failed"
             try:
+                t_db_start = time.perf_counter()
                 await persist(label_id=None, scam_score=score, scam_indicators=json.dumps(indicators),
                         is_quarantined=int(url_threat_confirmed), status="failed", source=None,
-                        analysis_status="failed", category_status="unavailable",
+                        analysis_status=failure_analysis_status, category_status="unavailable",
                         url_scan_status=url_scan_status, urls_total=urls_total, urls_checked=urls_checked,
                         received_at=received_at)
                 # Phase 1 Task 4: Offload blocking retry queue insert to thread pool
                 await asyncio.to_thread(add_to_retry_queue, email_id, user_id, "Analysis unavailable; retry required")
+                t_db = time.perf_counter() - t_db_start
             except Exception as save_error:
                 logger.error("[PIPELINE] Could not persist failure: %s", type(save_error).__name__)
             return {**base, "label": "Unknown", "scam_score": score,
                     "is_quarantined": int(url_threat_confirmed), "status": "failed",
-                    "analysis_status": "failed", "error": "Analysis unavailable — retry."}
+                    "analysis_status": failure_analysis_status, "error": "Analysis unavailable — retry."}
     finally:
         # Phase 1 Task 2: Always cleanup in-flight tracking
         await unregister_inflight_email(user_id, email_id)
+        clear_log_context()
 
 
 

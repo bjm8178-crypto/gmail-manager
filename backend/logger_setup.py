@@ -5,6 +5,8 @@ from typing import Any
 from logging.handlers import RotatingFileHandler
 
 
+import contextvars
+
 _REDACTION_PATTERNS = (
     (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer [REDACTED]"),
     (re.compile(r"\bAIza[0-9A-Za-z_-]{10,}"), "[REDACTED]"),
@@ -12,6 +14,24 @@ _REDACTION_PATTERNS = (
     (re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"), "[REDACTED]"),
     (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "[REDACTED]"),
 )
+
+# Phase 6 Task 18: ContextVars for run_id and email_id prefixing
+current_run_id: contextvars.ContextVar[str] = contextvars.ContextVar("current_run_id", default="")
+current_email_id: contextvars.ContextVar[str] = contextvars.ContextVar("current_email_id", default="")
+
+
+def set_log_context(run_id: str = "", email_id: str = ""):
+    """Set current run_id and email_id for logging context."""
+    if run_id:
+        current_run_id.set(run_id)
+    if email_id:
+        current_email_id.set(email_id)
+
+
+def clear_log_context():
+    """Clear current logging context."""
+    current_run_id.set("")
+    current_email_id.set("")
 
 
 def redact_secrets(value: Any) -> str:
@@ -24,7 +44,21 @@ def redact_secrets(value: Any) -> str:
 
 class SecretRedactionFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = redact_secrets(record.getMessage())
+        msg = redact_secrets(record.getMessage())
+        # Phase 6 Task 18: Add run_id + email_id prefix to every [AI] and [SECURITY] log line
+        run_id = current_run_id.get()
+        email_id = current_email_id.get()
+        if (run_id or email_id) and ("[AI]" in msg or "[SECURITY]" in msg):
+            prefix_parts = []
+            if run_id:
+                prefix_parts.append(f"run:{run_id[:8]}")
+            if email_id:
+                prefix_parts.append(f"email:{email_id[:12]}")
+            prefix = f"[{' '.join(prefix_parts)}] "
+            # Avoid duplicate prefixing if already present
+            if not msg.startswith(f"[{' '.join(prefix_parts)}]"):
+                msg = prefix + msg
+        record.msg = msg
         record.args = ()
         return True
 

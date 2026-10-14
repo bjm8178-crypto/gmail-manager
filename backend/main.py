@@ -9,6 +9,8 @@ import asyncio
 import os
 import sys
 import json
+import time
+import uuid
 import webbrowser
 from pathlib import Path
 from typing import Optional
@@ -643,21 +645,76 @@ async def emails_analyze_bulk(request: Request, user: dict = Depends(require_aut
             content={"error": "no_labels", "message": "You must create at least one label before running analysis. Go to Settings to add labels."}
         )
 
+    run_id = str(uuid.uuid4())
+    # Phase 6 Task 17: Background job state dictionary
+    if not hasattr(app.state, "bulk_jobs"):
+        app.state.bulk_jobs = {}
+
+    job_state = {
+        "job_id": run_id,
+        "user_id": user_id,
+        "status": "running",
+        "progress": 0,
+        "total": 0,
+        "events": [],
+        "result": None,
+        "error": None,
+        "created_at": time.time(),
+    }
+    app.state.bulk_jobs[run_id] = job_state
+
+    # Queue for SSE subscriber while background task runs independently
+    event_queue: asyncio.Queue = asyncio.Queue()
+
+    async def run_bulk_job_in_background():
+        try:
+            async for event in analyze_bulk_ordered(limit=limit, user_id=user_id, run_id=run_id):
+                job_state["events"].append(event)
+                if event.get("type") == "email_done":
+                    job_state["progress"] = event.get("progress", 0)
+                    job_state["total"] = event.get("total", 0)
+                elif event.get("type") == "complete":
+                    job_state["status"] = "completed"
+                    job_state["result"] = event
+                await event_queue.put(event)
+        except Exception as e:
+            logger.error("[BACKGROUND_JOB] Job %s failed: %s", run_id[:8], e)
+            job_state["status"] = "failed"
+            job_state["error"] = str(e)
+            await event_queue.put({"type": "error", "error": str(e)})
+        finally:
+            await event_queue.put(None)  # Sentinel to close SSE
+            await clear_user_inflight_emails(user_id)
+            release_user_job_lock(job_lock)
+            logger.info(f"[JOB_LOCK] Released bulk analysis lock for user {user_id} (job {run_id[:8]})")
+
+    # Launch as independent background task so SSE disconnect does NOT terminate analysis
+    asyncio.create_task(run_bulk_job_in_background())
+
+    # If client accepts JSON or requests background mode via query, return immediately
+    background_mode = request.query_params.get("background", "").lower() in ("1", "true", "yes")
+    if background_mode:
+        return JSONResponse({
+            "job_id": run_id,
+            "status": "running",
+            "status_url": f"/emails/bulk-status/{run_id}",
+        })
+
     from starlette.responses import StreamingResponse
 
     async def sse_stream():
         try:
-            async for event in analyze_bulk_ordered(limit=limit, user_id=user_id):
+            while True:
+                event = await event_queue.get()
+                if event is None:
+                    break
                 event_type = event.get("type", "message")
                 if event_type == "email_done":
                     event_type = "progress"
                 event_data = json.dumps(event)
                 yield f"event: {event_type}\ndata: {event_data}\n\n"
-        finally:
-            # Release lock and clear in-flight tracking when stream ends
-            await clear_user_inflight_emails(user_id)
-            release_user_job_lock(job_lock)
-            logger.info(f"[JOB_LOCK] Released bulk analysis lock for user {user_id}")
+        except GeneratorExit:
+            logger.info("[SSE] Client disconnected for job %s; analysis continues in background", run_id[:8])
 
     return StreamingResponse(
         sse_stream(),
@@ -665,8 +722,30 @@ async def emails_analyze_bulk(request: Request, user: dict = Depends(require_aut
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
+            "X-Job-ID": run_id,
         },
     )
+
+
+@app.get("/emails/bulk-status/{job_id}")
+async def get_bulk_status(job_id: str, user: dict = Depends(require_auth)):
+    """GET /emails/bulk-status/{job_id} - Polling endpoint for background bulk jobs."""
+    user_id = user["user_id"]
+    jobs = getattr(app.state, "bulk_jobs", {})
+    job = jobs.get(job_id)
+    if not job:
+        return JSONResponse(status_code=404, content={"error": "job_not_found"})
+    if job["user_id"] != user_id:
+        return JSONResponse(status_code=403, content={"error": "access_denied"})
+
+    return JSONResponse({
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "progress": job.get("progress", 0),
+        "total": job.get("total", 0),
+        "result": job.get("result"),
+        "error": job.get("error"),
+    })
 
 
 @app.post("/emails/fetch-only")

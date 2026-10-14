@@ -66,6 +66,7 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.db = MagicMock()
         self.security = ModuleType('security')
         self.security.extract_urls = MagicMock(return_value=[])
+        self.security.scan_urls_batch = AsyncMock(return_value={})
         self.security.scan_url = AsyncMock(return_value={'is_safe': 1, 'threat_type': None})
         self.routing = ModuleType('v2_routing')
         self.routing.route_email_with_v2 = AsyncMock(return_value={
@@ -108,19 +109,41 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.db.update_analyzed_email.call_args.kwargs['scam_score'])
 
     async def test_partial_link_coverage_is_persisted(self):
-        self.security.extract_urls.return_value = [f'https://example.test/{i}' for i in range(40)]
+        urls = [f'https://example.test/{i}' for i in range(40)]
+        self.security.extract_urls.return_value = urls
+        self.security.scan_urls_batch.return_value = {
+            url: {'url': url, 'is_safe': 1, 'threat_type': None, 'scan_failed': False}
+            for url in urls[:self.gmail.MAX_URLS_SCANNED]
+        }
         await self.analyze()
         saved = self.db.update_analyzed_email.call_args.kwargs
         self.assertEqual(saved['urls_total'], 40)
         self.assertEqual(saved['urls_checked'], 30)
         self.assertEqual(saved['url_scan_status'], 'partial')
-        self.assertEqual(saved['analysis_status'], 'partial')
+        self.assertEqual(saved['analysis_status'], 'completed')
 
     async def test_threat_review_is_independent_of_category(self):
         self.routing.route_email_with_v2.return_value.update(scam_score=95)
         result = await self.analyze()
         self.assertEqual(result['label'], 'Finance')
         self.assertEqual(result['is_quarantined'], 1)
+
+    async def test_failure_with_preserved_url_score_is_partial_not_failed(self):
+        url = 'https://example.test/phishing'
+        self.security.extract_urls.return_value = [url]
+        self.security.scan_urls_batch.return_value = {
+            url: {'url': url, 'is_safe': 0, 'threat_type': 'PHISHING', 'scan_failed': False}
+        }
+        self.routing.route_email_with_v2.side_effect = RuntimeError('provider unavailable')
+
+        result = await self.analyze()
+
+        saved = self.db.update_analyzed_email.call_args.kwargs
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['scam_score'], 95)
+        self.assertEqual(result['analysis_status'], 'partial')
+        self.assertEqual(saved['scam_score'], 95)
+        self.assertEqual(saved['analysis_status'], 'partial')
 
     async def test_local_model_fallback_records_provider_marker(self):
         self.routing.route_email_with_v2.return_value.update(provider_used=None)
