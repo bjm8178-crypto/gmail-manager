@@ -1003,11 +1003,13 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             url_scan_status = "unavailable"
 
         def persist(**values):
+            # Phase 1 Task 3: Enable transactional retry queue removal for success writes
+            remove_retry = values.get('status') == 'labeled'
             if update_mode:
-                update_analyzed_email(email_id=email_id, user_id=user_id, **values)
+                update_analyzed_email(email_id=email_id, user_id=user_id, remove_from_retry=remove_retry, **values)
             else:
                 save_analyzed_email(email_id=email_id, user_id=user_id, snippet=snippet,
-                                    sender=sender, subject=subject, body=body, **values)
+                                    sender=sender, subject=subject, body=body, remove_from_retry=remove_retry, **values)
 
         try:
             if not update_mode and is_already_analyzed(email_id, user_id):
@@ -1186,7 +1188,7 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                 attachment_risk=attachment_verdict,  # Phase 5: clean, suspicious, malicious
                 attachment_details=attachment_details,  # Phase 5: JSON scan results
             )
-            remove_from_retry_queue(email_id)
+            # Phase 1 Task 3: Retry queue removal now handled in persist() transaction
             return {**base, "label": label, "scam_score": score, "is_quarantined": quarantine,
                     "status": "success", "analysis_status": analysis_status,
                     "category_status": category_status, "url_scan_status": url_scan_status,

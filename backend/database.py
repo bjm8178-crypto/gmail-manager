@@ -779,8 +779,11 @@ def save_analyzed_email(email_id: str, user_id: int, label_id: int, scam_score: 
                          status: str = 'labeled', body: str = None,
                          source: str = 'ai', ml_confidence: float = None,
                          provider_used: str = None, *,
-                         reasoning=_UNSET, routing_decision=_UNSET, v2_score=_UNSET, analysis_status=_UNSET, category_status=_UNSET, url_scan_status=_UNSET, urls_total=_UNSET, urls_checked=_UNSET, received_at=_UNSET, user_decision=_UNSET, attachment_risk=_UNSET, attachment_details=_UNSET) -> None:
-    """Upsert within one account; omitted metadata is preserved, None clears it."""
+                         reasoning=_UNSET, routing_decision=_UNSET, v2_score=_UNSET, analysis_status=_UNSET, category_status=_UNSET, url_scan_status=_UNSET, urls_total=_UNSET, urls_checked=_UNSET, received_at=_UNSET, user_decision=_UNSET, attachment_risk=_UNSET, attachment_details=_UNSET, remove_from_retry=False) -> None:
+    """
+    Upsert within one account; omitted metadata is preserved, None clears it.
+    Phase 1 Task 3: Optionally remove from retry queue in same transaction (remove_from_retry=True).
+    """
     conn = _get_connection()
     try:
         cursor = conn.cursor()
@@ -811,8 +814,15 @@ def save_analyzed_email(email_id: str, user_id: int, label_id: int, scam_score: 
         if cursor.rowcount != 1:
             raise ValueError("Email ID belongs to a different account")
 
-        conn.commit()
         logger.info(f"[DB] Saved email {email_id[:12]}... label_id={label_id}, scam_score={scam_score}, status={status}, source={source}")
+        
+        # Phase 1 Task 3: Remove from retry queue AFTER success write, same transaction
+        if remove_from_retry and status == 'labeled':
+            _execute(cursor, "DELETE FROM retry_queue WHERE email_id = %s", (email_id,))
+            if cursor.rowcount > 0:
+                logger.info(f"[DB] Removed {email_id[:12]} from retry queue (same txn)")
+        
+        conn.commit()
     except Exception:
         conn.rollback()
         raise
@@ -824,11 +834,13 @@ def update_analyzed_email(email_id: str, label_id: int, scam_score: int,
                           scam_indicators: str, is_quarantined: int, status: str = 'labeled',
                           source: str = 'ai', ml_confidence: float = None,
                           provider_used: str = None, *, user_id: int,
-                         reasoning=_UNSET, routing_decision=_UNSET, v2_score=_UNSET, analysis_status=_UNSET, category_status=_UNSET, url_scan_status=_UNSET, urls_total=_UNSET, urls_checked=_UNSET, received_at=_UNSET, user_decision=_UNSET, attachment_risk=_UNSET, attachment_details=_UNSET) -> None:
+                         reasoning=_UNSET, routing_decision=_UNSET, v2_score=_UNSET, analysis_status=_UNSET, category_status=_UNSET, url_scan_status=_UNSET, urls_total=_UNSET, urls_checked=_UNSET, received_at=_UNSET, user_decision=_UNSET, attachment_risk=_UNSET, attachment_details=_UNSET, remove_from_retry=False) -> None:
     """
     Update an existing analyzed_emails row with AI results.
     Preserves the original analyzed_at timestamp and body.
     Used by label_only_pipeline via _analyze_one(update_mode=True).
+    Phase 1 Task 3: Never downgrade labeled rows with valid scam_score to failed status.
+    Phase 1 Task 3: Optionally remove from retry queue in same transaction (remove_from_retry=True).
     """
     conn = _get_connection()
     try:
@@ -842,11 +854,25 @@ def update_analyzed_email(email_id: str, label_id: int, scam_score: int,
              attachment_risk, attachment_details))
             if value is not _UNSET})
         assignments = ", ".join(f"{key} = %s" for key in values)
-        _execute(cursor, f"UPDATE analyzed_emails SET {assignments} "
-                 "WHERE email_id = %s AND user_id = %s",
-                 (*values.values(), email_id, user_id))
+        
+        # Phase 1 Task 3: Conditional update - don't overwrite good results with failures
+        # Allow update only if: (1) upgrading to success, OR (2) current row is not a successful label
+        where_clause = "WHERE email_id = %s AND user_id = %s AND (status != 'labeled' OR scam_score IS NULL OR %s != 'failed')"
+        _execute(cursor, f"UPDATE analyzed_emails SET {assignments} {where_clause}",
+                 (*values.values(), email_id, user_id, status))
+        
+        if cursor.rowcount == 0:
+            logger.warning(f"[DB] Skipped downgrade: {email_id[:12]} already has status=labeled with valid score (attempted status={status})")
+        else:
+            logger.info(f"[DB] Updated email {email_id[:12]}... to status={status}, label_id={label_id}, score={scam_score}")
+        
+        # Phase 1 Task 3: Remove from retry queue AFTER success write, same transaction
+        if remove_from_retry and status == 'labeled':
+            _execute(cursor, "DELETE FROM retry_queue WHERE email_id = %s", (email_id,))
+            if cursor.rowcount > 0:
+                logger.info(f"[DB] Removed {email_id[:12]} from retry queue (same txn)")
+        
         conn.commit()
-        logger.info(f"[DB] Updated email {email_id[:12]}... to status={status}, label_id={label_id}, score={scam_score}")
     except Exception:
         conn.rollback()
         raise
