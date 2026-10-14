@@ -8,7 +8,7 @@ import importlib.util
 import sys
 from pathlib import Path
 import pytest
-from unittest.mock import MagicMock, Mock, patch, AsyncMock
+from unittest.mock import MagicMock, Mock, patch, AsyncMock, call
 
 BACKEND = Path(__file__).resolve().parents[1]
 _modules = {name: MagicMock() for name in ("auth", "database", "ml_inference")}
@@ -18,6 +18,7 @@ with patch.dict(sys.modules, _modules):
     _spec.loader.exec_module(_gmail)
 analyze_bulk_ordered = _gmail.analyze_bulk_ordered
 fetch_only_pipeline = _gmail.fetch_only_pipeline
+label_only_pipeline = _gmail.label_only_pipeline
 
 
 @pytest.fixture(autouse=True)
@@ -196,3 +197,39 @@ async def test_fetch_only_pipeline_continues_after_deduplicating_a_page():
         {"limit": 1, "page_token": None, "user_email": "user@test.com"},
         {"limit": 1, "page_token": "page-2", "user_email": "user@test.com"},
     ]
+
+
+@pytest.mark.anyio
+async def test_analyze_bulk_ordered_repairs_failed_result_in_same_job():
+    email = {"id": "repair-me", "subject": "Retry", "sender": "sender@test.com", "body": "body"}
+    calls = []
+
+    async def fake_analyze_one(*args, **kwargs):
+        calls.append(kwargs.get("update_mode", False))
+        if kwargs.get("update_mode"):
+            return {
+                "status": "success", "analysis_status": "completed", "email_id": "repair-me",
+                "subject": "Retry", "sender": "sender@test.com", "label": "Work",
+                "scam_score": 10, "is_quarantined": 0,
+            }
+        return {
+            "status": "failed", "analysis_status": "failed", "email_id": "repair-me",
+            "subject": "Retry", "sender": "sender@test.com", "label": "Unknown",
+            "scam_score": None, "is_quarantined": 0,
+        }
+
+    with patch("gmail.get_gmail_service") as mock_service, \
+         patch("gmail._fetch_new_emails", new=AsyncMock(return_value=([email], 0, 1))), \
+         patch("gmail.get_labels", return_value=[{"label_name": "Work"}]), \
+         patch("gmail._analyze_one", new=AsyncMock(side_effect=fake_analyze_one)) as analyze, \
+         patch("gmail.asyncio.sleep", new=AsyncMock()) as sleep:
+        mock_service.return_value.users().labels().list().execute.return_value = {"labels": []}
+        events = [event async for event in analyze_bulk_ordered(limit=1, user_id=1, user_email="user@test.com")]
+
+    assert analyze.await_count == 2
+    assert sleep.await_args_list == [call(5)]
+    assert events[-1]["analyzed"] == 1
+    assert events[-1]["failed"] == 0
+    assert events[-1]["repair"] == {
+        "attempted": 1, "resolved": 1, "unresolved": 0, "unresolved_ids": [],
+    }

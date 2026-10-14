@@ -93,7 +93,8 @@ class RouterToGmailContractTests(unittest.IsolatedAsyncioTestCase):
         }
         saved = await self.analyze()
         self.assertEqual(saved['urls_checked'], self.gmail.MAX_URLS_SCANNED)
-        self.assertEqual(saved['analysis_status'], 'partial')
+        self.assertEqual(saved['url_scan_status'], 'partial')
+        self.assertEqual(saved['analysis_status'], 'completed')
 
     async def test_failed_scan_downgrades_to_partial(self):
         urls = ['https://example.test/a', 'https://example.test/b']

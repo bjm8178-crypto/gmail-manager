@@ -7,7 +7,7 @@ test('missing and failed scans cannot be low risk', () => {
 });
 test('completed analysis describes estimate, not a safety guarantee', () => {
  assert.equal(securitySummary({scam_score:0,analysis_status:'completed'}).label,'Low estimated risk');
- assert.equal(securitySummary({scam_score:0,analysis_status:'partial'}).label,'Low risk so far (partial scan)');
+ assert.equal(securitySummary({scam_score:0,analysis_status:'partial'}).label,'Low estimated risk · label unavailable');
  assert.equal(securitySummary({scam_score:90,analysis_status:'partial'}).label,'High estimated risk');
 });
 test('user decision never erases original risk', () => {
