@@ -26,6 +26,36 @@ def mock_email():
     }
 
 
+@pytest.fixture(autouse=True)
+async def clear_inflight():
+    from job_lock import clear_user_inflight_emails
+    await clear_user_inflight_emails(1)
+    yield
+    await clear_user_inflight_emails(1)
+
+
+def make_fake_to_thread(body="Email body text"):
+    async def fake_to_thread(fn, *a, **k):
+        name = getattr(fn, "__name__", "")
+        if name == "is_already_analyzed":
+            return False
+        if name in (
+            "save_analyzed_email",
+            "update_analyzed_email",
+            "get_label_id_by_name",
+            "remove_from_retry_queue",
+            "add_to_retry_queue",
+        ):
+            return None
+        if name == "_get_email_body":
+            return body
+        return fn(*a, **k)
+    return fake_to_thread
+
+
+fake_to_thread = make_fake_to_thread()
+
+
 @pytest.mark.asyncio
 async def test_v2_router_complete_analysis(mock_email):
     """Test successful V2 routing with complete analysis."""
@@ -53,7 +83,7 @@ async def test_v2_router_complete_analysis(mock_email):
          patch('gmail.is_already_analyzed', return_value=False), \
          patch('gmail.save_analyzed_email') as mock_save, \
          patch('gmail.remove_from_retry_queue'), \
-         patch('gmail.asyncio.to_thread', new_callable=AsyncMock, return_value='Email body text'), \
+         patch('gmail.asyncio.to_thread', side_effect=fake_to_thread), \
          patch('security.scan_url', new_callable=AsyncMock, return_value={'is_safe': 1, 'threat_type': None}), \
          patch('gmail.get_gmail_service', return_value=MagicMock()):
         
@@ -119,7 +149,7 @@ async def test_v2_router_unavailable_ai_fallback(mock_email):
              patch('gmail.is_already_analyzed', return_value=False), \
              patch('gmail.save_analyzed_email') as mock_save, \
              patch('gmail.remove_from_retry_queue'), \
-             patch('gmail.asyncio.to_thread', new_callable=AsyncMock, return_value='Email body'), \
+             patch('gmail.asyncio.to_thread', side_effect=fake_to_thread), \
              patch('security.scan_url', new_callable=AsyncMock, return_value={'is_safe': 1}), \
              patch('gmail.get_gmail_service', return_value=MagicMock()):
             
@@ -174,13 +204,15 @@ async def test_url_threat_overrides_low_score(mock_email):
         'url_scan_unavailable': False,
     }
     
+    url = 'https://malicious-site.example.com/phishing'
     with patch('v2_routing.route_email_with_v2', new_callable=AsyncMock, return_value=mock_routed), \
          patch('gmail.get_labels', return_value=[{'label_name': 'Personal', 'label_id': 44}]), \
          patch('gmail.get_label_id_by_name', return_value=44), \
          patch('gmail.is_already_analyzed', return_value=False), \
          patch('gmail.save_analyzed_email') as mock_save, \
          patch('gmail.remove_from_retry_queue'), \
-         patch('gmail.asyncio.to_thread', new_callable=AsyncMock, return_value='Please review the invoice at https://malicious-site.example.com/phishing'), \
+         patch('gmail.asyncio.to_thread', side_effect=make_fake_to_thread(f'Please review the invoice at {url}')), \
+         patch('security.scan_urls_batch', new_callable=AsyncMock, return_value={url: {'is_safe': 0, 'threat_type': 'MALWARE'}}), \
          patch('security.scan_url', new_callable=AsyncMock, return_value={'is_safe': 0, 'threat_type': 'MALWARE'}), \
          patch('gmail.get_gmail_service', return_value=MagicMock()):
         
@@ -236,7 +268,7 @@ async def test_empty_label_list_unavailable_category(mock_email):
          patch('gmail.is_already_analyzed', return_value=False), \
          patch('gmail.save_analyzed_email') as mock_save, \
          patch('gmail.remove_from_retry_queue'), \
-         patch('gmail.asyncio.to_thread', new_callable=AsyncMock, return_value='Email body'), \
+         patch('gmail.asyncio.to_thread', side_effect=fake_to_thread), \
          patch('security.scan_url', new_callable=AsyncMock, return_value={'is_safe': 1}), \
          patch('gmail.get_gmail_service', return_value=MagicMock()):
         
@@ -282,13 +314,15 @@ async def test_safe_browsing_unavailable_reported_correctly(mock_email):
         'url_scan_unavailable': False,
     }
     
+    url = 'https://example.com/invoice'
     with patch('v2_routing.route_email_with_v2', new_callable=AsyncMock, return_value=mock_routed), \
          patch('gmail.get_labels', return_value=[{'label_name': 'Finance', 'label_id': 42}]), \
          patch('gmail.get_label_id_by_name', return_value=42), \
          patch('gmail.is_already_analyzed', return_value=False), \
          patch('gmail.save_analyzed_email') as mock_save, \
          patch('gmail.remove_from_retry_queue'), \
-         patch('gmail.asyncio.to_thread', new_callable=AsyncMock, return_value='Check this link: https://example.com/invoice'), \
+         patch('gmail.asyncio.to_thread', side_effect=make_fake_to_thread(f'Check this link: {url}')), \
+         patch('security.scan_urls_batch', new_callable=AsyncMock, return_value={url: {'is_safe': None, 'scan_failed': True}}), \
          patch('security.scan_url', new_callable=AsyncMock, return_value={'is_safe': None, 'scan_failed': True}), \
          patch('gmail.get_gmail_service', return_value=MagicMock()):
         
@@ -307,10 +341,10 @@ async def test_safe_browsing_unavailable_reported_correctly(mock_email):
             update_mode=False
         )
         
-        # URL scan failure → unavailable, analysis becomes partial
+        # URL scan failure → unavailable, but analysis_status remains completed per STATUS_DEFINITIONS.md (Phase 3 Task 11)
         assert result['url_scan_status'] == 'unavailable'
         assert result['urls_checked'] == 0
-        assert result['analysis_status'] == 'partial'  # Not complete due to unavailable URL scan
+        assert result['analysis_status'] == 'completed'
         
         call_kwargs = mock_save.call_args[1]
         assert call_kwargs['url_scan_status'] == 'unavailable'
@@ -321,12 +355,14 @@ async def test_analysis_failure_preserves_url_threat(mock_email):
     """Test that analysis failure preserves URL threat evidence."""
     from gmail import _analyze_one
     
+    url = 'https://phishing-site.example.com/steal'
     with patch('v2_routing.route_email_with_v2', side_effect=ValueError("AI analysis failed")), \
          patch('gmail.get_labels', return_value=[{'label_name': 'Finance'}]), \
          patch('gmail.is_already_analyzed', return_value=False), \
          patch('gmail.save_analyzed_email') as mock_save, \
          patch('gmail.add_to_retry_queue'), \
-         patch('gmail.asyncio.to_thread', new_callable=AsyncMock, return_value='Click here to claim your prize: https://phishing-site.example.com/steal'), \
+         patch('gmail.asyncio.to_thread', side_effect=make_fake_to_thread(f'Click here to claim your prize: {url}')), \
+         patch('security.scan_urls_batch', new_callable=AsyncMock, return_value={url: {'is_safe': 0, 'threat_type': 'PHISHING'}}), \
          patch('security.scan_url', new_callable=AsyncMock, return_value={'is_safe': 0, 'threat_type': 'PHISHING'}), \
          patch('gmail.get_gmail_service', return_value=MagicMock()):
         

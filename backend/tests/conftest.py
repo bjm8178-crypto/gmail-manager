@@ -9,6 +9,8 @@ from pathlib import Path
 import sys
 import uuid
 
+os.environ.setdefault("DB_POOL_MAX", "50")
+
 import pytest
 
 BACKEND = Path(__file__).resolve().parents[1]
@@ -73,3 +75,21 @@ def restore_encryption_configuration():
     yield
     if "encryption" in sys.modules:
         importlib.reload(sys.modules["encryption"])
+
+
+@pytest.fixture(autouse=True)
+def sync_db_sequences():
+    """Ensure PostgreSQL sequences stay ahead of manually inserted IDs."""
+    yield
+    import database
+    if getattr(database, "_pg_pool", None) is not None:
+        try:
+            conn = database._get_connection()
+            try:
+                cur = conn.cursor()
+                database._execute(cur, "SELECT setval('users_user_id_seq', COALESCE((SELECT MAX(user_id) FROM users), 0) + 1, false)")
+                conn.commit()
+            finally:
+                database._release_connection(conn)
+        except Exception:
+            pass
