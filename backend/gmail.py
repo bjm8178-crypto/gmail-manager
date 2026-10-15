@@ -1173,14 +1173,17 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
     t_email_start = time.perf_counter()
     t_body = t_url = t_ml = t_ai = t_db = 0.0
 
+    sem_held = False
     try:
-        async with semaphore:
-            body = email.get("body", "")
-            snippet = email.get("snippet", "")
-            received_at = email.get("received_at")
-            url_threat_confirmed = False
-            urls_total = urls_checked = 0
-            url_scan_status = "unavailable"
+        # Hold the concurrency semaphore for the WHOLE analysis (released in finally).
+        await semaphore.acquire()
+        sem_held = True
+        body = email.get("body", "")
+        snippet = email.get("snippet", "")
+        received_at = email.get("received_at")
+        url_threat_confirmed = False
+        urls_total = urls_checked = 0
+        url_scan_status = "unavailable"
 
         def persist(**values):
             # Phase 1 Task 4: Enable transactional retry queue removal for success writes
@@ -1459,6 +1462,8 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                     "is_quarantined": int(url_threat_confirmed), "status": "failed",
                     "analysis_status": failure_analysis_status, "error": "Analysis unavailable — retry."}
     finally:
+        if sem_held:
+            semaphore.release()
         # Phase 1 Task 2: Always cleanup in-flight tracking
         await unregister_inflight_email(user_id, email_id)
         clear_log_context()
