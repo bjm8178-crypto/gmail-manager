@@ -56,15 +56,18 @@ class TestAuditLoggingCore:
         
         # Verify log was created
         conn = _get_connection()
-        cursor = conn.cursor()
-        _execute(cursor, "SELECT * FROM audit_log WHERE user_id = 1")
-        row = cursor.fetchone()
-        
-        assert row is not None
-        assert row["action"] == ACTION_LOGIN
-        assert row["ip_address"] == "192.168.1.1"
-        assert row["user_agent"] == "Mozilla/5.0"
-        assert row["severity"] == SEVERITY_INFO
+        try:
+            cursor = conn.cursor()
+            _execute(cursor, "SELECT * FROM audit_log WHERE user_id = 1")
+            row = cursor.fetchone()
+            
+            assert row is not None
+            assert row["action"] == ACTION_LOGIN
+            assert row["ip_address"] == "192.168.1.1"
+            assert row["user_agent"] == "Mozilla/5.0"
+            assert row["severity"] == SEVERITY_INFO
+        finally:
+            _release_connection(conn)
     
     def test_log_event_with_resource(self):
         """Test logging with resource type and ID."""
@@ -81,12 +84,15 @@ class TestAuditLoggingCore:
         )
         
         conn = _get_connection()
-        cursor = conn.cursor()
-        _execute(cursor, "SELECT resource_type, resource_id FROM audit_log WHERE user_id = 1")
-        row = cursor.fetchone()
-        
-        assert row["resource_type"] == "email"
-        assert row["resource_id"] == "abc123"
+        try:
+            cursor = conn.cursor()
+            _execute(cursor, "SELECT resource_type, resource_id FROM audit_log WHERE user_id = 1")
+            row = cursor.fetchone()
+            
+            assert row["resource_type"] == "email"
+            assert row["resource_id"] == "abc123"
+        finally:
+            _release_connection(conn)
     
     def test_log_event_without_user_id(self):
         """Test logging unauthenticated events (failed login)."""
@@ -101,12 +107,15 @@ class TestAuditLoggingCore:
         )
         
         conn = _get_connection()
-        cursor = conn.cursor()
-        _execute(cursor, "SELECT user_id, action FROM audit_log WHERE action = %s", (ACTION_LOGIN_FAILED,))
-        row = cursor.fetchone()
-        
-        assert row["user_id"] is None
-        assert row["action"] == ACTION_LOGIN_FAILED
+        try:
+            cursor = conn.cursor()
+            _execute(cursor, "SELECT user_id, action FROM audit_log WHERE action = %s", (ACTION_LOGIN_FAILED,))
+            row = cursor.fetchone()
+            
+            assert row["user_id"] is None
+            assert row["action"] == ACTION_LOGIN_FAILED
+        finally:
+            _release_connection(conn)
     
     def test_log_event_metadata_json(self):
         """Test metadata JSON serialization."""
@@ -126,14 +135,17 @@ class TestAuditLoggingCore:
         )
         
         conn = _get_connection()
-        cursor = conn.cursor()
-        _execute(cursor, "SELECT metadata FROM audit_log WHERE user_id = 1")
-        row = cursor.fetchone()
-        
-        stored_metadata = json.loads(row["metadata"])
-        assert stored_metadata["count"] == 15
-        assert len(stored_metadata["sample_ids"]) == 3
-        assert stored_metadata["delete_mode"] == "trash"
+        try:
+            cursor = conn.cursor()
+            _execute(cursor, "SELECT metadata FROM audit_log WHERE user_id = 1")
+            row = cursor.fetchone()
+            
+            stored_metadata = json.loads(row["metadata"])
+            assert stored_metadata["count"] == 15
+            assert len(stored_metadata["sample_ids"]) == 3
+            assert stored_metadata["delete_mode"] == "trash"
+        finally:
+            _release_connection(conn)
 
 
 class TestAuditLogRetrieval:
@@ -233,33 +245,36 @@ class TestAuditLogCleanup:
         from audit import log_event, cleanup_old_logs, ACTION_LOGIN
         
         conn = _get_connection()
-        cursor = conn.cursor()
-        
-        # Create old log (100 days ago)
-        old_timestamp = (datetime.utcnow() - timedelta(days=100)).isoformat()
-        _execute(cursor, """
-            INSERT INTO audit_log (user_id, action, timestamp, ip_address, severity)
-            VALUES (1, %s, %s, '10.0.0.1', 'info')
-        """, (ACTION_LOGIN, old_timestamp))
-        
-        # Create recent log (10 days ago)
-        recent_timestamp = (datetime.utcnow() - timedelta(days=10)).isoformat()
-        _execute(cursor, """
-            INSERT INTO audit_log (user_id, action, timestamp, ip_address, severity)
-            VALUES (1, %s, %s, '10.0.0.2', 'info')
-        """, (ACTION_LOGIN, recent_timestamp))
-        
-        conn.commit()
-        
-        # Cleanup logs older than 90 days
-        deleted_count = cleanup_old_logs(retention_days=90)
-        
-        assert deleted_count == 1
-        
-        # Verify only recent log remains
-        _execute(cursor, "SELECT COUNT(*) AS count FROM audit_log WHERE user_id = 1")
-        count = cursor.fetchone()["count"]
-        assert count == 1
+        try:
+            cursor = conn.cursor()
+            
+            # Create old log (100 days ago)
+            old_timestamp = (datetime.utcnow() - timedelta(days=100)).isoformat()
+            _execute(cursor, """
+                INSERT INTO audit_log (user_id, action, timestamp, ip_address, severity)
+                VALUES (1, %s, %s, '10.0.0.1', 'info')
+            """, (ACTION_LOGIN, old_timestamp))
+            
+            # Create recent log (10 days ago)
+            recent_timestamp = (datetime.utcnow() - timedelta(days=10)).isoformat()
+            _execute(cursor, """
+                INSERT INTO audit_log (user_id, action, timestamp, ip_address, severity)
+                VALUES (1, %s, %s, '10.0.0.2', 'info')
+            """, (ACTION_LOGIN, recent_timestamp))
+            
+            conn.commit()
+            
+            # Cleanup logs older than 90 days
+            deleted_count = cleanup_old_logs(retention_days=90)
+            
+            assert deleted_count == 1
+            
+            # Verify only recent log remains
+            _execute(cursor, "SELECT COUNT(*) AS count FROM audit_log WHERE user_id = 1")
+            count = cursor.fetchone()["count"]
+            assert count == 1
+        finally:
+            _release_connection(conn)
 
 
 class TestAuditEndpoints:
@@ -339,32 +354,35 @@ class TestAuditGDPRCompliance:
         from audit import cleanup_old_logs
         
         conn = _get_connection()
-        cursor = conn.cursor()
-        
-        # Create log 91 days ago (should be deleted)
-        old_timestamp = (datetime.utcnow() - timedelta(days=91)).isoformat()
-        _execute(cursor, """
-            INSERT INTO audit_log (user_id, action, timestamp, ip_address, severity)
-            VALUES (1, 'test.action', %s, '10.0.0.1', 'info')
-        """, (old_timestamp,))
-        
-        # Create log 89 days ago (should be kept)
-        recent_timestamp = (datetime.utcnow() - timedelta(days=89)).isoformat()
-        _execute(cursor, """
-            INSERT INTO audit_log (user_id, action, timestamp, ip_address, severity)
-            VALUES (1, 'test.action', %s, '10.0.0.2', 'info')
-        """, (recent_timestamp,))
-        
-        conn.commit()
-        
-        # Run cleanup
-        deleted = cleanup_old_logs(retention_days=90)
-        assert deleted == 1
-        
-        # Verify retention
-        _execute(cursor, "SELECT COUNT(*) AS count FROM audit_log")
-        count = cursor.fetchone()["count"]
-        assert count == 1
+        try:
+            cursor = conn.cursor()
+            
+            # Create log 91 days ago (should be deleted)
+            old_timestamp = (datetime.utcnow() - timedelta(days=91)).isoformat()
+            _execute(cursor, """
+                INSERT INTO audit_log (user_id, action, timestamp, ip_address, severity)
+                VALUES (1, 'test.action', %s, '10.0.0.1', 'info')
+            """, (old_timestamp,))
+            
+            # Create log 89 days ago (should be kept)
+            recent_timestamp = (datetime.utcnow() - timedelta(days=89)).isoformat()
+            _execute(cursor, """
+                INSERT INTO audit_log (user_id, action, timestamp, ip_address, severity)
+                VALUES (1, 'test.action', %s, '10.0.0.2', 'info')
+            """, (recent_timestamp,))
+            
+            conn.commit()
+            
+            # Run cleanup
+            deleted = cleanup_old_logs(retention_days=90)
+            assert deleted == 1
+            
+            # Verify retention
+            _execute(cursor, "SELECT COUNT(*) AS count FROM audit_log")
+            count = cursor.fetchone()["count"]
+            assert count == 1
+        finally:
+            _release_connection(conn)
 
 
 if __name__ == "__main__":
