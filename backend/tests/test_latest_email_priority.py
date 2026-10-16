@@ -159,6 +159,7 @@ async def test_analyze_bulk_ordered_continues_after_deduplicating_a_page():
     with patch("gmail.get_gmail_service") as mock_service, \
          patch("gmail.fetch_emails", side_effect=[first_page, second_page]) as mock_fetch, \
          patch("gmail.get_labels", return_value=[]), \
+         patch("gmail.get_analyzed_email_ids", side_effect=[{"already-seen"}, set()]), \
          patch("gmail.is_already_analyzed", side_effect=[True, False]), \
          patch("gmail._analyze_one", new=AsyncMock(return_value=analysis_result)):
         mock_service.return_value.users().labels().list().execute.return_value = {"labels": []}
@@ -186,13 +187,18 @@ async def test_fetch_only_pipeline_continues_after_deduplicating_a_page():
 
     with patch("gmail.get_gmail_service", return_value=Mock()), \
          patch("gmail.fetch_emails", side_effect=[first_page, second_page]) as mock_fetch, \
+         patch("gmail.get_analyzed_email_ids", side_effect=[{"already-seen"}, set()]), \
          patch("gmail.is_already_analyzed", side_effect=[True, False]), \
          patch("gmail.save_analyzed_email") as mock_save, \
+         patch("gmail.save_fetched_emails_bulk") as mock_save_bulk, \
+         patch("gmail.get_credentials", return_value=Mock()), \
+         patch("gmail._get_email_bodies_batch", return_value={"new-email": "body text"}), \
          patch("gmail._get_email_body", return_value="body text"):
         events = [event async for event in fetch_only_pipeline(limit=1, user_id=1, user_email="user@test.com")]
 
     assert events[-1] == {"type": "complete", "fetched": 1, "skipped": 1}
-    mock_save.assert_called_once()
+    # Exactly one email saved — via bulk (FETCH_BATCH=1) or per-email (FETCH_BATCH=0)
+    assert mock_save.call_count + mock_save_bulk.call_count == 1
     assert [call.kwargs for call in mock_fetch.call_args_list] == [
         {"limit": 1, "page_token": None, "user_email": "user@test.com"},
         {"limit": 1, "page_token": "page-2", "user_email": "user@test.com"},
