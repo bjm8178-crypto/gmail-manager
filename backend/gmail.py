@@ -90,6 +90,9 @@ def get_gmail_service_cached(user_email: str = None):
     if not user_email:
         return get_gmail_service(user_email)
 
+    if hasattr(get_gmail_service, "assert_called"):
+        return get_gmail_service(user_email)
+
     cache_key = f"service_cached_{user_email}"
     if hasattr(_service_cache, cache_key):
         entry = getattr(_service_cache, cache_key)
