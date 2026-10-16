@@ -22,6 +22,7 @@ socket.setdefaulttimeout(15)
 from auth import get_credentials
 from database import (
     is_already_analyzed, save_analyzed_email,
+    get_analyzed_email_ids, save_fetched_emails_bulk,
     get_scan_cursor, save_scan_cursor,
     get_labels, get_label_id_by_name,
     get_user_email_by_id,
@@ -461,6 +462,87 @@ def _extract_body_with_images(payload: dict) -> str:
     return html_body
 
 
+def _get_email_bodies_batch(creds, email_ids: list[str]) -> dict[str, str]:
+    """
+    Fetch full email bodies for a list of email_ids using Gmail BatchHttpRequest.
+    Handles 429 rate-limiting with exponential backoff (up to 3 attempts).
+    Returns dict: {email_id: extracted_body_html_or_text}.
+    Step 2 perf/batching.
+    """
+    if not email_ids:
+        return {}
+
+    import time
+
+    # Build per-worker Gmail service instance if creds is an OAuth credentials object;
+    # or use directly if a service mock/instance was passed.
+    if hasattr(creds, "users") and callable(getattr(creds, "users")):
+        service = creds
+    else:
+        try:
+            service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        except Exception as e:
+            logger.info(f"[GMAIL] Failed to build Gmail service for batch bodies: {e}")
+            return {mid: "" for mid in email_ids}
+
+    results: dict[str, dict] = {}
+    pending_ids = list(email_ids)
+
+    for attempt in range(3):
+        if not pending_ids:
+            break
+
+        errors: dict[str, Exception] = {}
+
+        def _callback(request_id, response, exception):
+            if exception is not None:
+                errors[request_id] = exception
+            else:
+                results[request_id] = response
+
+        batch = service.new_batch_http_request(callback=_callback)
+        for mid in pending_ids:
+            batch.add(
+                service.users().messages().get(
+                    userId="me",
+                    id=mid,
+                    format="full",
+                ),
+                request_id=mid,
+            )
+
+        batch.execute()
+        pending_ids = []
+        retry_ids = []
+        for mid, exc in errors.items():
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            if status == 429:
+                retry_ids.append(mid)
+            else:
+                logger.info(f"[GMAIL] Error fetching body for email {mid} (batch): {exc}")
+
+        if retry_ids:
+            pending_ids = retry_ids
+            if attempt < 2:
+                delay = 2 ** attempt
+                logger.info(f"[GMAIL] Batch body fetch rate-limited for {len(retry_ids)} emails; retrying in {delay}s")
+                time.sleep(delay)
+
+    for mid in pending_ids:
+        logger.info(f"[GMAIL] Dropping email {mid} after batch body fetch retries")
+
+    bodies = {}
+    for mid in email_ids:
+        if mid in results:
+            msg = results[mid]
+            payload = msg.get("payload", {}) if isinstance(msg, dict) else {}
+            bodies[mid] = _extract_body_with_images(payload)
+        else:
+            bodies[mid] = ""
+
+    return bodies
+
+
 # ---------- GMAIL LABEL MANAGEMENT ----------
 
 # Gmail API only accepts colors from this fixed palette.
@@ -632,6 +714,9 @@ def change_label(user_email: str, email_id: str, old_label_id: str | None, new_l
 # ---------- BATCHED LABEL SYNC (Step 1 perf/batching) ----------
 
 SYNC_BATCH = int(os.environ.get("SYNC_BATCH", "1"))
+FETCH_BATCH = int(os.environ.get("FETCH_BATCH", "1"))
+FETCH_BATCH_SIZE = int(os.environ.get("FETCH_BATCH_SIZE", "25"))
+FETCH_BATCH_PARALLEL = int(os.environ.get("FETCH_BATCH_PARALLEL", "2"))
 
 
 def sync_labels_batch(user_id: int, user_email: str, gmail_labels_cache: dict[str, str],
@@ -1021,11 +1106,20 @@ async def _fetch_new_emails(limit: int, user_id: int, user_email: str):
         fetched_emails = fetch_result["emails"]
         fetched_count += len(fetched_emails)
 
-        for email in fetched_emails:
-            if is_already_analyzed(email["id"], user_id):
-                skipped_count += 1
-            else:
-                new_emails.append(email)
+        if FETCH_BATCH:
+            ids = [e["id"] for e in fetched_emails]
+            analyzed_ids = await asyncio.to_thread(get_analyzed_email_ids, user_id, ids)
+            for email in fetched_emails:
+                if email["id"] in analyzed_ids:
+                    skipped_count += 1
+                else:
+                    new_emails.append(email)
+        else:
+            for email in fetched_emails:
+                if is_already_analyzed(email["id"], user_id):
+                    skipped_count += 1
+                else:
+                    new_emails.append(email)
 
         next_page_token = fetch_result.get("next_page_token")
         if not fetched_emails or not next_page_token:
@@ -1745,34 +1839,104 @@ async def fetch_only_pipeline(limit: int = 50, user_id: int = None, user_email: 
         yield {"type": "complete", "fetched": 0, "error": "An internal error occurred during analysis."}
         return
 
-    saved_count = 0
-    for email in new_emails:
-        try:
-            # Fetch full body before saving (metadata fetch returns body="")
-            body = email.get("body", "")
-            if not body:
-                body = await asyncio.to_thread(_get_email_body, service, email["id"])
-            
-            save_analyzed_email(
-                email_id=email["id"],
-                user_id=user_id,
-                label_id=None,
-                scam_score=None,
-                scam_indicators='[]',
-                is_quarantined=0,
-                snippet=email.get("snippet", ""),
-                sender=email.get("sender", ""),
-                subject=email.get("subject", ""),
-                status='fetched',
-                body=body,
-            )
-            saved_count += 1
-            yield {"type": "progress", "current": saved_count, "total": len(new_emails)}
-        except Exception as e:
-            logger.info(f"[FETCH-ONLY] Failed to save {email['id']}: {e}")
-            continue
+    if FETCH_BATCH:
+        # Step 2 perf/batching: batch body fetch and bulk DB insertion
+        creds = await asyncio.to_thread(get_credentials, user_email)
+        worker_creds = creds if creds else service
 
-    yield {"type": "complete", "fetched": saved_count, "skipped": skipped_count}
+        chunks = [
+            new_emails[i:i + FETCH_BATCH_SIZE]
+            for i in range(0, len(new_emails), FETCH_BATCH_SIZE)
+        ]
+        worker_sem = asyncio.Semaphore(FETCH_BATCH_PARALLEL)
+
+        async def _process_chunk(chunk):
+            chunk_ids = [e["id"] for e in chunk]
+            try:
+                async with worker_sem:
+                    bodies = await asyncio.to_thread(_get_email_bodies_batch, worker_creds, chunk_ids)
+            except Exception as e:
+                logger.info(f"[FETCH-ONLY] Batch body fetch failed for {len(chunk_ids)} emails: {e}")
+                bodies = {}
+
+            rows = []
+            for email in chunk:
+                eid = email["id"]
+                b = email.get("body") or bodies.get(eid, "")
+                email["body"] = b
+                rows.append({
+                    "email_id": eid,
+                    "snippet": email.get("snippet", ""),
+                    "sender": email.get("sender", ""),
+                    "subject": email.get("subject", ""),
+                    "body": b,
+                })
+
+            try:
+                await asyncio.to_thread(save_fetched_emails_bulk, user_id, rows)
+                return len(rows)
+            except Exception as e:
+                logger.info(f"[FETCH-ONLY] Bulk save failed, falling back to per-email save: {e}")
+                saved = 0
+                for r in rows:
+                    try:
+                        await asyncio.to_thread(
+                            save_analyzed_email,
+                            email_id=r["email_id"],
+                            user_id=user_id,
+                            label_id=None,
+                            scam_score=None,
+                            scam_indicators='[]',
+                            is_quarantined=0,
+                            snippet=r["snippet"],
+                            sender=r["sender"],
+                            subject=r["subject"],
+                            status='fetched',
+                            body=r["body"],
+                        )
+                        saved += 1
+                    except Exception:
+                        pass
+                return saved
+
+        saved_count = 0
+        tasks = [asyncio.create_task(_process_chunk(c)) for c in chunks]
+        for coro in asyncio.as_completed(tasks):
+            chunk_saved = await coro
+            saved_count += chunk_saved
+            yield {"type": "progress", "current": saved_count, "total": len(new_emails)}
+
+        yield {"type": "complete", "fetched": saved_count, "skipped": skipped_count}
+    else:
+        # Legacy sequential loop
+        saved_count = 0
+        for email in new_emails:
+            try:
+                # Fetch full body before saving (metadata fetch returns body="")
+                body = email.get("body", "")
+                if not body:
+                    body = await asyncio.to_thread(_get_email_body, service, email["id"])
+                
+                save_analyzed_email(
+                    email_id=email["id"],
+                    user_id=user_id,
+                    label_id=None,
+                    scam_score=None,
+                    scam_indicators='[]',
+                    is_quarantined=0,
+                    snippet=email.get("snippet", ""),
+                    sender=email.get("sender", ""),
+                    subject=email.get("subject", ""),
+                    status='fetched',
+                    body=body,
+                )
+                saved_count += 1
+                yield {"type": "progress", "current": saved_count, "total": len(new_emails)}
+            except Exception as e:
+                logger.info(f"[FETCH-ONLY] Failed to save {email['id']}: {e}")
+                continue
+
+        yield {"type": "complete", "fetched": saved_count, "skipped": skipped_count}
 
 
 async def label_only_pipeline(limit: int = None, user_id: int = None, user_email: str = None, email_ids: list[str] = None, run_id: str = None):

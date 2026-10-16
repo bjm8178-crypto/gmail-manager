@@ -1018,6 +1018,62 @@ def is_already_analyzed(email_id: str, user_id: int) -> bool:
         _release_connection(conn)
 
 
+def get_analyzed_email_ids(user_id: int, email_ids: list[str]) -> set:
+    """Return set of email_ids that already exist in analyzed_emails for this user.
+    Batch version of is_already_analyzed for Step 2 perf/batching.
+    """
+    if not email_ids:
+        return set()
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        _execute(cursor,
+            "SELECT email_id FROM analyzed_emails WHERE user_id = %s AND email_id = ANY(%s)",
+            (user_id, email_ids),
+        )
+        return {row['email_id'] for row in cursor.fetchall()}
+    finally:
+        _release_connection(conn)
+
+
+def save_fetched_emails_bulk(user_id: int, rows: list[dict]):
+    """Bulk-insert fetched emails as status='fetched' placeholders.
+    Uses INSERT ... ON CONFLICT (email_id) DO NOTHING to never overwrite existing rows.
+    Step 2 perf/batching.
+
+    Args:
+        rows: list of dicts with keys: email_id, snippet, sender, subject, body
+    """
+    if not rows:
+        return
+    from psycopg2.extras import execute_values
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        # Process in chunks of 100 rows per transaction
+        for chunk_start in range(0, len(rows), 100):
+            chunk = rows[chunk_start:chunk_start + 100]
+            values = [
+                (r['email_id'], user_id, None, None, '[]', 0,
+                 r.get('snippet', ''), r.get('sender', ''), r.get('subject', ''),
+                 'fetched', r.get('body', ''))
+                for r in chunk
+            ]
+            execute_values(cursor, """
+                INSERT INTO analyzed_emails
+                    (email_id, user_id, label_id, scam_score, scam_indicators,
+                     is_quarantined, snippet, sender, subject, status, body)
+                VALUES %s
+                ON CONFLICT (email_id) DO NOTHING
+            """, values,
+            template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _release_connection(conn)
+
 def get_analyzed_emails(user_id: int, limit: int = None) -> list[dict]:
     """
     Return all analyzed emails for user joined with custom_labels.
