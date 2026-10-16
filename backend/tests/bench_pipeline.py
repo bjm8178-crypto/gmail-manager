@@ -311,7 +311,11 @@ async def bench_sync(emails, metrics):
     def fake_get_connection():
         conn = MagicMock()
         cursor = MagicMock()
-        cursor.fetchall.return_value = [{"email_id": e["id"]} for e in emails]
+        cursor.connection.encoding = 'UTF8'
+        cursor.fetchall.return_value = [
+            {"email_id": e["id"], "label_id": 2, "last_applied_label_id": None, "label_name": "Work"}
+            for e in emails
+        ]
         cursor.fetchone.side_effect = lambda: {"label_id": 2, "last_applied_label_id": None}
         conn.cursor.return_value = cursor
         
@@ -349,8 +353,13 @@ async def bench_sync(emails, metrics):
 
         def fake_batch_req(callback=None):
             req = MagicMock()
+            items = []
+            req.add.side_effect = lambda r, request_id: items.append((request_id, r))
             def fake_batch_execute():
                 metrics.sync_gmail(1, 0.150)
+                if callback:
+                    for req_id, _ in items:
+                        callback(req_id, {"id": req_id, "labelIds": ["Label_2"]}, None)
             req.execute.side_effect = fake_batch_execute
             return req
         svc.new_batch_http_request.side_effect = fake_batch_req
@@ -367,6 +376,7 @@ async def bench_sync(emails, metrics):
          patch("database._release_connection", side_effect=fake_release_connection), \
          patch("main._execute", side_effect=lambda c, q, p=None: metrics.sync_db(1, 0.005)), \
          patch("database._execute", side_effect=lambda c, q, p=None: metrics.sync_db(1, 0.005)), \
+         patch("psycopg2.extras.execute_values", side_effect=lambda c, q, a, **k: metrics.sync_db(1, 0.005)), \
          patch("main._request_user_email", return_value="bench@test.com"), \
          patch("gmail.get_gmail_service", side_effect=fake_get_gmail_service), \
          patch("database.get_labels", side_effect=fake_get_labels), \

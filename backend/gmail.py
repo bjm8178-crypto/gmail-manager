@@ -10,6 +10,7 @@ logger = get_logger(__name__)
 
 import json
 import asyncio
+import os
 import time
 import socket
 socket.setdefaulttimeout(15)
@@ -626,6 +627,240 @@ def change_label(user_email: str, email_id: str, old_label_id: str | None, new_l
     except Exception as e:
         logger.info(f"[GMAIL] Error changing label on {email_id}: {e}")
         raise
+
+
+# ---------- BATCHED LABEL SYNC (Step 1 perf/batching) ----------
+
+SYNC_BATCH = int(os.environ.get("SYNC_BATCH", "1"))
+
+
+def sync_labels_batch(user_id: int, user_email: str, gmail_labels_cache: dict[str, str],
+                      email_ids: list[str], per_email_fallback=None) -> dict:
+    """
+    Batch-sync Gmail labels for a list of email_ids using batchModify.
+    Falls back to per-email sync on failure. Behind SYNC_BATCH=1 flag.
+
+    Args:
+        per_email_fallback: callable(email_id, user_id, user_email, gmail_labels_cache) -> dict
+            Used for chunks that fail after retries. If None, failed chunks are just counted.
+
+    Returns: {'applied': int, 'failed': int, 'errors': [{'email_id': str, 'error': str}]}
+    """
+    import random
+    from database import _get_connection, _release_connection, _execute
+    from psycopg2.extras import execute_values
+
+    applied = 0
+    failed = 0
+    errors = []
+
+    # 1. ONE SELECT for all pending rows with label name
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        _execute(cursor, """
+            SELECT ae.email_id, ae.label_id, ae.last_applied_label_id, cl.label_name
+            FROM analyzed_emails ae
+            JOIN custom_labels cl ON ae.label_id = cl.label_id
+            WHERE ae.user_id = %s AND ae.email_id = ANY(%s)
+        """, (user_id, email_ids))
+        rows = cursor.fetchall()
+    finally:
+        _release_connection(conn)
+
+    if not rows:
+        return {'applied': 0, 'failed': 0, 'errors': []}
+
+    # 2. Build ONE Gmail service for the whole batch
+    service = get_gmail_service(user_email)
+    if not service:
+        return {'applied': 0, 'failed': len(email_ids),
+                'errors': [{'email_id': 'all', 'error': 'Gmail service unavailable'}]}
+
+    # 3. Resolve each DISTINCT label_name to a Gmail label ID
+    label_names = set(r['label_name'] for r in rows)
+    gmail_label_map = {}  # label_name -> gmail_label_id
+    for name in label_names:
+        gid = get_or_create_label(user_email, name, user_id, gmail_labels_cache)
+        if gid:
+            gmail_label_map[name] = gid
+
+    # Also resolve old labels (last_applied_label_id) to Gmail IDs
+    labels_db = get_labels(user_id)
+    label_id_to_name = {l['label_id']: l['label_name'] for l in labels_db}
+    old_gmail_ids = {}  # label_id -> gmail_label_id (cached)
+
+    def _resolve_old_gmail_id(old_label_id):
+        if old_label_id is None:
+            return None
+        if old_label_id in old_gmail_ids:
+            return old_gmail_ids[old_label_id]
+        old_name = label_id_to_name.get(old_label_id)
+        if old_name:
+            gid = get_or_create_label(user_email, old_name, user_id, gmail_labels_cache)
+            old_gmail_ids[old_label_id] = gid
+            return gid
+        old_gmail_ids[old_label_id] = None
+        return None
+
+    # 4. Group emails by (old_gmail_label_id, new_gmail_label_id)
+    already_synced = []  # (email_id, label_id) pairs where last_applied == current
+    groups = {}  # (old_gid_or_None, new_gid) -> [(email_id, label_id), ...]
+
+    for row in rows:
+        eid = row['email_id']
+        lid = row['label_id']
+        last_lid = row['last_applied_label_id']
+        lname = row['label_name']
+
+        new_gid = gmail_label_map.get(lname)
+        if not new_gid:
+            failed += 1
+            errors.append({'email_id': eid, 'error': f'Gmail label not found for {lname}'})
+            continue
+
+        if last_lid == lid:
+            # Already synced, just mark applied_to_gmail=1
+            already_synced.append((eid, lid))
+            continue
+
+        old_gid = _resolve_old_gmail_id(last_lid)
+        key = (old_gid, new_gid)
+        groups.setdefault(key, []).append((eid, lid))
+
+    # 5. Process each group with batchModify
+    success_pairs = list(already_synced)  # Will also get marked applied
+
+    for (old_gid, new_gid), items in groups.items():
+        # Chunk to <= 1000 ids per batchModify call
+        for chunk_start in range(0, len(items), 1000):
+            chunk = items[chunk_start:chunk_start + 1000]
+            chunk_ids = [eid for eid, _ in chunk]
+
+            body = {'ids': chunk_ids, 'addLabelIds': [new_gid]}
+            if old_gid:
+                body['removeLabelIds'] = [old_gid]
+
+            batch_ok = False
+            for attempt in range(3):
+                try:
+                    service.users().messages().batchModify(userId='me', body=body).execute()
+                    batch_ok = True
+                    break
+                except Exception as e:
+                    status = getattr(getattr(e, 'resp', None), 'status', None)
+                    if status in (429, 500, 502, 503) and attempt < 2:
+                        delay = (2 ** attempt) + random.uniform(0, 1)
+                        logger.warning("[BATCH-SYNC] batchModify %d/%d retrying in %.1fs: %s",
+                                       attempt + 1, 3, delay, e)
+                        time.sleep(delay)
+                    else:
+                        logger.error("[BATCH-SYNC] batchModify failed for %d emails: %s",
+                                     len(chunk_ids), e)
+                        break
+
+            if batch_ok:
+                # Verify a sample of up to 5 ids
+                sample_size = min(5, len(chunk_ids))
+                sample_ids = [chunk_ids[0]]
+                if len(chunk_ids) > 1:
+                    sample_ids.append(chunk_ids[-1])
+                if len(chunk_ids) > 2:
+                    mid_indices = random.sample(range(1, len(chunk_ids) - 1),
+                                                min(sample_size - 2, len(chunk_ids) - 2))
+                    sample_ids.extend(chunk_ids[i] for i in mid_indices)
+
+                verify_ok = True
+                try:
+                    verify_results = {}
+                    verify_errors = {}
+
+                    def _verify_cb(req_id, response, exception):
+                        if exception:
+                            verify_errors[req_id] = exception
+                        else:
+                            verify_results[req_id] = response
+
+                    batch_req = service.new_batch_http_request(callback=_verify_cb)
+                    for sid in sample_ids:
+                        batch_req.add(
+                            service.users().messages().get(userId='me', id=sid, format='minimal'),
+                            request_id=sid,
+                        )
+                    batch_req.execute()
+
+                    for sid in sample_ids:
+                        if sid in verify_results:
+                            if new_gid not in verify_results[sid].get('labelIds', []):
+                                verify_ok = False
+                                logger.warning("[BATCH-SYNC] Verification failed: %s lacks label %s",
+                                               sid[:12], new_gid)
+                                break
+                except Exception as ve:
+                    logger.warning("[BATCH-SYNC] Verification error: %s", ve)
+                    verify_ok = False
+
+                if verify_ok:
+                    success_pairs.extend(chunk)
+                    applied += len(chunk)
+                else:
+                    # Verification failed: fall back to per-email
+                    logger.warning("[BATCH-SYNC] Falling back to per-email for %d emails", len(chunk))
+                    for eid, lid in chunk:
+                        if per_email_fallback:
+                            try:
+                                result = per_email_fallback(eid, user_id, user_email, gmail_labels_cache)
+                                if result.get('success'):
+                                    success_pairs.append((eid, lid))
+                                    applied += 1
+                                else:
+                                    failed += 1
+                                    errors.append({'email_id': eid, 'error': result.get('error', 'Verify fallback failed')})
+                            except Exception as fe:
+                                failed += 1
+                                errors.append({'email_id': eid, 'error': str(fe)})
+                        else:
+                            failed += 1
+                            errors.append({'email_id': eid, 'error': 'Verification failed, no fallback'})
+            else:
+                # batchModify failed: fall back to per-email for this chunk
+                for eid, lid in chunk:
+                    if per_email_fallback:
+                        try:
+                            result = per_email_fallback(eid, user_id, user_email, gmail_labels_cache)
+                            if result.get('success'):
+                                success_pairs.append((eid, lid))
+                                applied += 1
+                            else:
+                                failed += 1
+                                errors.append({'email_id': eid, 'error': result.get('error', 'Fallback failed')})
+                        except Exception as fe:
+                            failed += 1
+                            errors.append({'email_id': eid, 'error': str(fe)})
+                    else:
+                        failed += 1
+                        errors.append({'email_id': eid, 'error': 'batchModify failed, no fallback'})
+
+    # Count already-synced as applied
+    applied += len(already_synced)
+
+    # 6. Bulk DB update: mark success in ONE statement
+    if success_pairs:
+        conn = _get_connection()
+        try:
+            cursor = conn.cursor()
+            execute_values(cursor, """
+                UPDATE analyzed_emails
+                SET applied_to_gmail = 1, last_applied_label_id = v.label_id
+                FROM (VALUES %s) AS v(email_id, label_id, uid)
+                WHERE analyzed_emails.email_id = v.email_id
+                AND analyzed_emails.user_id = v.uid
+            """, [(eid, lid, user_id) for eid, lid in success_pairs])
+            conn.commit()
+        finally:
+            _release_connection(conn)
+
+    return {'applied': applied, 'failed': failed, 'errors': errors}
 
 
 def trash_email(email_id: str, user_email: str = None) -> bool:
