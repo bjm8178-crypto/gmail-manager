@@ -1863,6 +1863,40 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                 await persist(label_id=None, scam_score=None, scam_indicators="[]", is_quarantined=0,
                         status="fetched", received_at=received_at, analysis_status="pending")
 
+            async def run_ai_cascade():
+                nonlocal precomputed_ai_result
+                if precomputed_ai_result is not None:
+                    return precomputed_ai_result
+                if ai_batcher is not None:
+                    batch_item = {
+                        "id": email_id,
+                        "subject": subject,
+                        "sender": sender,
+                        "snippet": snippet,
+                        "body": _analysis_text(body)[:6000],
+                        "url_threat_confirmed": url_threat_confirmed,
+                        "url_scan_unavailable": url_scan_unavailable,
+                    }
+                    batch_res = await ai_batcher.submit(batch_item)
+                    if batch_res is not None:
+                        return batch_res
+                    logger.info(
+                        f"[AI-BATCH] Batch AI yielded None for {email_id[:12]}; falling back to single AI call"
+                    )
+                if ai_calls_tracker is not None:
+                    ai_calls_tracker[0] += 1
+                prompt = classification_prompt.format(
+                    sender=sender, subject=subject, body=_analysis_text(body)[:6000],
+                    url_threat_confirmed=url_threat_confirmed,
+                    url_scan_unavailable=url_scan_unavailable,
+                    available_labels=", ".join(available_label_names),
+                )
+                import inspect
+                res = ai_router.analyze_json(prompt)
+                if inspect.isawaitable(res):
+                    return await res
+                return res
+
             # Phase 1 Task 4: Offload HTML parsing (BeautifulSoup) to thread pool
             # Phase 3 Task 10: Batch URL scanning (single Safe Browsing API call)
             if email.get("url_threat_confirmed") is not None:
@@ -1882,30 +1916,27 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                 t_url_start = time.perf_counter()
 
                 scan_task = asyncio.create_task(scan_urls_batch(selected_urls, email_id, url_client))
-
-                async def _ai_early():
-                    if ai_calls_tracker is not None:
-                        ai_calls_tracker[0] += 1
-                    p = classification_prompt.format(
-                        sender=sender, subject=subject, body=_analysis_text(body)[:6000],
-                        url_threat_confirmed=False,
-                        url_scan_unavailable=False,
-                        available_labels=", ".join(available_label_names),
-                    )
-                    return await ai_router.analyze_json(p)
-
-                ai_early_task = asyncio.create_task(_ai_early())
-                scan_results_dict, early_ai_res = await asyncio.gather(scan_task, ai_early_task)
+                ai_early_task = asyncio.create_task(run_ai_cascade())
+                gather_res = await asyncio.gather(scan_task, ai_early_task, return_exceptions=True)
                 t_url = time.perf_counter() - t_url_start
 
-                url_scan_unavailable = len(selected_urls) < urls_total
-                for url, result in scan_results_dict.items():
-                    if result.get("scan_failed") or result.get("is_safe") is None:
-                        url_scan_unavailable = True
-                        continue
-                    urls_checked += 1
-                    if result.get("is_safe") == 0 and result.get("threat_type"):
-                        url_threat_confirmed = True
+                scan_res, ai_res = gather_res[0], gather_res[1]
+
+                # URL failure doesn't discard AI
+                if isinstance(scan_res, Exception):
+                    logger.info(f"[URL-SCAN] URL scan failed for {email_id[:12]}: {scan_res}")
+                    scan_results_dict = {}
+                    url_scan_unavailable = True
+                else:
+                    scan_results_dict = scan_res if isinstance(scan_res, dict) else {}
+                    url_scan_unavailable = len(selected_urls) < urls_total
+                    for url, result in scan_results_dict.items():
+                        if result.get("scan_failed") or result.get("is_safe") is None:
+                            url_scan_unavailable = True
+                            continue
+                        urls_checked += 1
+                        if result.get("is_safe") == 0 and result.get("threat_type"):
+                            url_threat_confirmed = True
 
                 url_scan_status = (
                     "threat_detected" if url_threat_confirmed else
@@ -1914,7 +1945,12 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                     "partial" if url_scan_unavailable else "completed"
                 )
 
-                precomputed_ai_result = early_ai_res
+                # AI failure still records URL
+                if isinstance(ai_res, Exception):
+                    logger.info(f"[URL-AI-OVERLAP] Early AI failed for {email_id[:12]}: {ai_res}")
+                    precomputed_ai_result = None
+                else:
+                    precomputed_ai_result = ai_res
             else:
                 t_url_start = time.perf_counter()
                 urls = list(dict.fromkeys(await asyncio.to_thread(extract_urls, body)))
@@ -1981,35 +2017,6 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             except Exception as init_err:
                 logger.error("[PIPELINE] V2 router initialization failed: %s", str(init_err))
                 V2_ROUTER_AVAILABLE = False
-
-            async def run_ai_cascade():
-                if precomputed_ai_result is not None:
-                    return precomputed_ai_result
-                if ai_batcher is not None:
-                    batch_item = {
-                        "id": email_id,
-                        "subject": subject,
-                        "sender": sender,
-                        "snippet": snippet,
-                        "body": _analysis_text(body)[:6000],
-                        "url_threat_confirmed": url_threat_confirmed,
-                        "url_scan_unavailable": url_scan_unavailable,
-                    }
-                    batch_res = await ai_batcher.submit(batch_item)
-                    if batch_res is not None:
-                        return batch_res
-                    logger.info(
-                        f"[AI-BATCH] Batch AI yielded None for {email_id[:12]}; falling back to single AI call"
-                    )
-                if ai_calls_tracker is not None:
-                    ai_calls_tracker[0] += 1
-                prompt = classification_prompt.format(
-                    sender=sender, subject=subject, body=_analysis_text(body)[:6000],
-                    url_threat_confirmed=url_threat_confirmed,
-                    url_scan_unavailable=url_scan_unavailable,
-                    available_labels=", ".join(available_label_names),
-                )
-                return await ai_router.analyze_json(prompt)
 
             if V2_ROUTER_AVAILABLE:
                 routed = await route_email_with_v2(
