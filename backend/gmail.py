@@ -782,6 +782,7 @@ FETCH_BATCH = int(os.environ.get("FETCH_BATCH", "1"))
 FETCH_BATCH_SIZE = int(os.environ.get("FETCH_BATCH_SIZE", "25"))
 FETCH_BATCH_PARALLEL = int(os.environ.get("FETCH_BATCH_PARALLEL", "2"))
 URL_AI_OVERLAP = int(os.environ.get("URL_AI_OVERLAP", "0"))
+DB_BATCH_WRITES = int(os.environ.get("DB_BATCH_WRITES", "0"))
 
 
 def sync_labels_batch(user_id: int, user_email: str, gmail_labels_cache: dict[str, str],
@@ -1011,6 +1012,95 @@ def sync_labels_batch(user_id: int, user_email: str, gmail_labels_cache: dict[st
             _release_connection(conn)
 
     return {'applied': applied, 'failed': failed, 'errors': errors}
+
+
+class DBBatchWriter:
+    """
+    Batches async DB updates for analyzed_emails behind DB_BATCH_WRITES=1.
+    Each submit(row) returns a Future that resolves only AFTER the row is committed.
+    Flushes every 20 rows or 1.5s, or on explicit flush()/close().
+    Falls back to per-row update_analyzed_email if the bulk update fails.
+    Step 5 perf/batching.
+    """
+    def __init__(self, user_id: int, max_batch_size: int = 20, flush_interval: float = 1.5):
+        self.user_id = user_id
+        self.max_batch_size = max_batch_size
+        self.flush_interval = flush_interval
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+        self._closed = False
+
+    def start(self):
+        if self._worker_task is None:
+            self._worker_task = asyncio.create_task(self._run_loop())
+
+    async def submit(self, row: dict) -> bool:
+        """Submit a row for batched writing. Awaits durable DB commit."""
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        await self._queue.put((row, fut))
+        return await fut
+
+    async def _flush_items(self, items: list[tuple[dict, asyncio.Future]]):
+        if not items:
+            return
+        rows = [it[0] for it in items]
+        futs = [it[1] for it in items]
+        try:
+            from database import update_analyzed_emails_bulk
+            await asyncio.to_thread(update_analyzed_emails_bulk, self.user_id, rows)
+            for f in futs:
+                if not f.done():
+                    f.set_result(True)
+        except Exception as e:
+            logger.warning("[DB-BATCH] Bulk update failed (%s), falling back per-row", e)
+            from database import update_analyzed_email
+            for r, f in items:
+                try:
+                    kwargs = dict(r)
+                    eid = kwargs.pop("email_id")
+                    kwargs["user_id"] = self.user_id
+                    await asyncio.to_thread(update_analyzed_email, eid, **kwargs)
+                    if not f.done():
+                        f.set_result(True)
+                except Exception as row_err:
+                    if not f.done():
+                        f.set_exception(row_err)
+
+    async def _run_loop(self):
+        while not self._closed or not self._queue.empty():
+            batch = []
+            try:
+                item = await asyncio.wait_for(self._queue.get(), timeout=self.flush_interval)
+                batch.append(item)
+                while len(batch) < self.max_batch_size and not self._queue.empty():
+                    batch.append(self._queue.get_nowait())
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                break
+
+            if batch:
+                await self._flush_items(batch)
+
+    async def flush(self):
+        """Drain and write all remaining items in the queue."""
+        batch = []
+        while not self._queue.empty():
+            batch.append(self._queue.get_nowait())
+        if batch:
+            await self._flush_items(batch)
+
+    async def close(self):
+        self._closed = True
+        if self._worker_task:
+            await self.flush()
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+            self._worker_task = None
 
 
 def trash_email(email_id: str, user_email: str = None) -> bool:
@@ -1547,7 +1637,8 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                        label_id_map: dict[str, int] = None,
                        ai_calls_tracker: list[int] = None,
                        gmail_calls_tracker: list[int] = None,
-                       precomputed_ai_result: dict = None) -> dict:
+                       precomputed_ai_result: dict = None,
+                       db_writer = None) -> dict:
     """
     Persist a suggestion and its evidence; Gmail changes require explicit approval.
     Phase 1 Task 2: Track in-flight emails to prevent concurrent analysis.
@@ -1587,6 +1678,11 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             # Phase 1 Task 4: Enable transactional retry queue removal for success writes
             remove_retry = values.get('status') == 'labeled'
             if update_mode:
+                if db_writer is not None:
+                    row = dict(values)
+                    row["email_id"] = email_id
+                    row["remove_from_retry"] = remove_retry
+                    return db_writer.submit(row)
                 # Phase 1 Task 4: Offload blocking DB update to thread pool
                 return asyncio.to_thread(update_analyzed_email, email_id=email_id, user_id=user_id, remove_from_retry=remove_retry, **values)
             else:
@@ -2131,68 +2227,115 @@ async def label_only_pipeline(limit: int = None, user_id: int = None, user_email
         failed_count = 0
         results = []
 
-        if AI_BATCH_SIZE > 1:
-            # Step 3 perf/batching: Process in chunks of AI_BATCH_SIZE
-            from security import extract_urls, scan_urls_batch
+        db_writer = None
+        if DB_BATCH_WRITES:
+            db_writer = DBBatchWriter(user_id=user_id)
+            db_writer.start()
 
-            chunks = [
-                fetched_emails[i:i + AI_BATCH_SIZE]
-                for i in range(0, len(fetched_emails), AI_BATCH_SIZE)
-            ]
+        try:
+            if AI_BATCH_SIZE > 1:
+                # Step 3 perf/batching: Process in chunks of AI_BATCH_SIZE
+                from security import extract_urls, scan_urls_batch
 
-            for chunk in chunks:
-                # Stage A: Run URL scans concurrently for each email in chunk
-                async def _scan_urls_for_email(em):
-                    em_body = em.get("body", "")
-                    if not em_body:
-                        return
-                    urls = list(dict.fromkeys(await asyncio.to_thread(extract_urls, em_body)))
-                    selected = urls[:MAX_URLS_SCANNED]
-                    scan_dict = await scan_urls_batch(selected, em["id"], url_client)
-                    threat = False
-                    checked = 0
-                    unavail = len(selected) < len(urls)
-                    for u, r in scan_dict.items():
-                        if r.get("scan_failed") or r.get("is_safe") is None:
-                            unavail = True
-                            continue
-                        checked += 1
-                        if r.get("is_safe") == 0 and r.get("threat_type"):
-                            threat = True
-                    em["url_threat_confirmed"] = threat
-                    em["url_scan_unavailable"] = unavail
-
-                await asyncio.gather(*[_scan_urls_for_email(em) for em in chunk])
-
-                # Stage B: One batch AI call for up to AI_BATCH_SIZE emails
-                items = [
-                    {
-                        "id": em["id"],
-                        "subject": em.get("subject", ""),
-                        "sender": em.get("sender", ""),
-                        "snippet": em.get("snippet", ""),
-                        "body": em.get("body", ""),
-                        "url_threat_confirmed": em.get("url_threat_confirmed", False),
-                        "url_scan_unavailable": em.get("url_scan_unavailable", False),
-                    }
-                    for em in chunk
+                chunks = [
+                    fetched_emails[i:i + AI_BATCH_SIZE]
+                    for i in range(0, len(fetched_emails), AI_BATCH_SIZE)
                 ]
-                batch_res = await ai_router.analyze_batch(items, available_label_names)
-                if pipeline_ai_calls is not None:
-                    pipeline_ai_calls[0] += 1
 
-                ai_map = {}
-                for res_item in batch_res.get("results", []):
-                    if isinstance(res_item, dict) and "id" in res_item:
-                        ai_map[res_item["id"]] = {
-                            "data": res_item,
-                            "provider_used": batch_res.get("provider_used"),
+                for chunk in chunks:
+                    # Stage A: Run URL scans concurrently for each email in chunk
+                    async def _scan_urls_for_email(em):
+                        em_body = em.get("body", "")
+                        if not em_body:
+                            return
+                        urls = list(dict.fromkeys(await asyncio.to_thread(extract_urls, em_body)))
+                        selected = urls[:MAX_URLS_SCANNED]
+                        scan_dict = await scan_urls_batch(selected, em["id"], url_client)
+                        threat = False
+                        checked = 0
+                        unavail = len(selected) < len(urls)
+                        for u, r in scan_dict.items():
+                            if r.get("scan_failed") or r.get("is_safe") is None:
+                                unavail = True
+                                continue
+                            checked += 1
+                            if r.get("is_safe") == 0 and r.get("threat_type"):
+                                threat = True
+                        em["url_threat_confirmed"] = threat
+                        em["url_scan_unavailable"] = unavail
+
+                    await asyncio.gather(*[_scan_urls_for_email(em) for em in chunk])
+
+                    # Stage B: One batch AI call for up to AI_BATCH_SIZE emails
+                    items = [
+                        {
+                            "id": em["id"],
+                            "subject": em.get("subject", ""),
+                            "sender": em.get("sender", ""),
+                            "snippet": em.get("snippet", ""),
+                            "body": em.get("body", ""),
+                            "url_threat_confirmed": em.get("url_threat_confirmed", False),
+                            "url_scan_unavailable": em.get("url_scan_unavailable", False),
                         }
+                        for em in chunk
+                    ]
+                    batch_res = await ai_router.analyze_batch(items, available_label_names)
+                    if pipeline_ai_calls is not None:
+                        pipeline_ai_calls[0] += 1
 
-                # Stage C: Run _analyze_one for each email using that email's AI result
-                chunk_tasks = [
+                    ai_map = {}
+                    for res_item in batch_res.get("results", []):
+                        if isinstance(res_item, dict) and "id" in res_item:
+                            ai_map[res_item["id"]] = {
+                                "data": res_item,
+                                "provider_used": batch_res.get("provider_used"),
+                            }
+
+                    # Stage C: Run _analyze_one for each email using that email's AI result
+                    chunk_tasks = [
+                        asyncio.create_task(_analyze_one(
+                            email=em,
+                            semaphore=semaphore,
+                            ai_router=ai_router,
+                            classification_prompt=CLASSIFICATION_PROMPT,
+                            user_id=user_id,
+                            user_email=user_email,
+                            service=service,
+                            url_client=url_client,
+                            url_semaphore=url_semaphore,
+                            available_label_names=available_label_names,
+                            gmail_labels_cache=gmail_labels_cache,
+                            update_mode=True,
+                            label_id_map=label_id_by_name,
+                            ai_calls_tracker=None,  # tracked at batch level
+                            gmail_calls_tracker=pipeline_gmail_calls,
+                            precomputed_ai_result=ai_map.get(em["id"]),
+                            db_writer=db_writer,
+                        ))
+                        for em in chunk
+                    ]
+
+                    chunk_results = await asyncio.gather(*chunk_tasks)
+                    for result in chunk_results:
+                        if result.get("status") == "failed":
+                            failed_count += 1
+                        elif result.get("status") == "success":
+                            analyzed_count += 1
+                            results.append(result)
+
+                        yield {
+                            "type": "email_done",
+                            "current": analyzed_count + failed_count,
+                            "total": total,
+                            "email_id": result.get("email_id"),
+                            "subject": result.get("subject"),
+                            "label": result.get("label", ""),
+                            "scam_score": result.get("scam_score", 0),
+                        }
+            else:
+                tasks = [
                     asyncio.create_task(_analyze_one(
-                        email=em,
+                        email=email,
                         semaphore=semaphore,
                         ai_router=ai_router,
                         classification_prompt=CLASSIFICATION_PROMPT,
@@ -2205,21 +2348,30 @@ async def label_only_pipeline(limit: int = None, user_id: int = None, user_email
                         gmail_labels_cache=gmail_labels_cache,
                         update_mode=True,
                         label_id_map=label_id_by_name,
-                        ai_calls_tracker=None,  # tracked at batch level
+                        ai_calls_tracker=pipeline_ai_calls,
                         gmail_calls_tracker=pipeline_gmail_calls,
-                        precomputed_ai_result=ai_map.get(em["id"]),
+                        db_writer=db_writer,
                     ))
-                    for em in chunk
+                    for email in fetched_emails
                 ]
 
-                chunk_results = await asyncio.gather(*chunk_tasks)
-                for result in chunk_results:
+                done_queue = asyncio.Queue()
+                
+                async def track_completion(task, idx):
+                    result = await task
+                    await done_queue.put((idx, result))
+                
+                tracking_tasks = [asyncio.create_task(track_completion(t, i)) for i, t in enumerate(tasks)]
+                
+                for _ in range(len(tasks)):
+                    idx, result = await done_queue.get()
+                    
                     if result.get("status") == "failed":
                         failed_count += 1
                     elif result.get("status") == "success":
                         analyzed_count += 1
                         results.append(result)
-
+                    
                     yield {
                         "type": "email_done",
                         "current": analyzed_count + failed_count,
@@ -2229,56 +2381,11 @@ async def label_only_pipeline(limit: int = None, user_id: int = None, user_email
                         "label": result.get("label", ""),
                         "scam_score": result.get("scam_score", 0),
                     }
-        else:
-            tasks = [
-                asyncio.create_task(_analyze_one(
-                    email=email,
-                    semaphore=semaphore,
-                    ai_router=ai_router,
-                    classification_prompt=CLASSIFICATION_PROMPT,
-                    user_id=user_id,
-                    user_email=user_email,
-                    service=service,
-                    url_client=url_client,
-                    url_semaphore=url_semaphore,
-                    available_label_names=available_label_names,
-                    gmail_labels_cache=gmail_labels_cache,
-                    update_mode=True,
-                    label_id_map=label_id_by_name,
-                    ai_calls_tracker=pipeline_ai_calls,
-                    gmail_calls_tracker=pipeline_gmail_calls,
-                ))
-                for email in fetched_emails
-            ]
-
-            done_queue = asyncio.Queue()
-            
-            async def track_completion(task, idx):
-                result = await task
-                await done_queue.put((idx, result))
-            
-            tracking_tasks = [asyncio.create_task(track_completion(t, i)) for i, t in enumerate(tasks)]
-            
-            for _ in range(len(tasks)):
-                idx, result = await done_queue.get()
                 
-                if result.get("status") == "failed":
-                    failed_count += 1
-                elif result.get("status") == "success":
-                    analyzed_count += 1
-                    results.append(result)
-                
-                yield {
-                    "type": "email_done",
-                    "current": analyzed_count + failed_count,
-                    "total": total,
-                    "email_id": result.get("email_id"),
-                    "subject": result.get("subject"),
-                    "label": result.get("label", ""),
-                    "scam_score": result.get("scam_score", 0),
-                }
-            
-            await asyncio.gather(*tracking_tasks)
+                await asyncio.gather(*tracking_tasks)
+        finally:
+            if db_writer is not None:
+                await db_writer.close()
         
         wall = time.perf_counter() - t_pipeline_start
         total_emails = analyzed_count + failed_count

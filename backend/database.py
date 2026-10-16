@@ -898,6 +898,112 @@ def update_analyzed_email(email_id: str, label_id: int, scam_score: int,
         _release_connection(conn)
 
 
+def update_analyzed_emails_bulk(user_id: int, rows: list[dict]) -> int:
+    """
+    Bulk update analyzed_emails with AI analysis results in a single statement.
+    Enforces the same no-downgrade guard as update_analyzed_email:
+      WHERE a.email_id = v.email_id
+        AND a.user_id = v.uid
+        AND (a.status != 'labeled' OR a.scam_score IS NULL OR v.status != 'failed')
+    And removes successfully labeled rows from retry_queue in the same transaction.
+    Step 5 perf/batching.
+
+    Args:
+        user_id: Owner user ID
+        rows: List of dicts matching update_analyzed_email args:
+              email_id, label_id, scam_score, scam_indicators, is_quarantined,
+              status, source, ml_confidence, provider_used, reasoning,
+              routing_decision, v2_score, analysis_status, category_status,
+              url_scan_status, urls_total, urls_checked, received_at,
+              attachment_risk, attachment_details, remove_from_retry
+    """
+    if not rows:
+        return 0
+
+    from psycopg2.extras import execute_values
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        data = [
+            (
+                r["email_id"],
+                r.get("label_id"),
+                r.get("scam_score"),
+                r.get("scam_indicators", "[]"),
+                r.get("is_quarantined", 0),
+                r.get("status", "labeled"),
+                r.get("source"),
+                r.get("ml_confidence"),
+                r.get("provider_used"),
+                r.get("reasoning", ""),
+                r.get("routing_decision", ""),
+                r.get("v2_score"),
+                r.get("analysis_status"),
+                r.get("category_status"),
+                r.get("url_scan_status"),
+                r.get("urls_total", 0),
+                r.get("urls_checked", 0),
+                r.get("received_at"),
+                r.get("attachment_risk"),
+                r.get("attachment_details"),
+                user_id,
+            )
+            for r in rows
+        ]
+
+        sql = """
+            UPDATE analyzed_emails AS a
+            SET
+                label_id = v.label_id,
+                scam_score = v.scam_score,
+                scam_indicators = v.scam_indicators,
+                is_quarantined = v.is_quarantined,
+                status = v.status,
+                source = v.source,
+                ml_confidence = v.ml_confidence,
+                provider_used = v.provider_used,
+                reasoning = v.reasoning,
+                routing_decision = v.routing_decision,
+                v2_score = v.v2_score,
+                analysis_status = v.analysis_status,
+                category_status = v.category_status,
+                url_scan_status = v.url_scan_status,
+                urls_total = v.urls_total,
+                urls_checked = v.urls_checked,
+                received_at = v.received_at,
+                attachment_risk = v.attachment_risk,
+                attachment_details = v.attachment_details
+            FROM (VALUES %s) AS v(
+                email_id, label_id, scam_score, scam_indicators, is_quarantined,
+                status, source, ml_confidence, provider_used, reasoning,
+                routing_decision, v2_score, analysis_status, category_status,
+                url_scan_status, urls_total, urls_checked, received_at,
+                attachment_risk, attachment_details, uid
+            )
+            WHERE a.email_id = v.email_id
+              AND a.user_id = v.uid
+              AND (a.status != 'labeled' OR a.scam_score IS NULL OR v.status != 'failed')
+        """
+        execute_values(cursor, sql, data)
+        rowcount = cursor.rowcount
+
+        # Remove labeled rows from retry_queue in same transaction
+        remove_ids = [
+            r["email_id"] for r in rows
+            if r.get("status") == "labeled" and r.get("remove_from_retry", True)
+        ]
+        if remove_ids:
+            _execute(cursor, "DELETE FROM retry_queue WHERE email_id = ANY(%s)", (remove_ids,))
+
+        conn.commit()
+        return rowcount
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _release_connection(conn)
+
+
 def update_email_label_id(email_id: str, label_id: int, *, user_id: int) -> None:
     """
     Update only the label_id for an email (manual label override).
