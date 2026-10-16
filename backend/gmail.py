@@ -35,6 +35,26 @@ import threading
 _service_cache = threading.local()
 
 
+def _get_service_for_thread(creds):
+    """Reuse or build a thread-local Gmail service instance for the given credentials.
+    Step 4b perf/batching.
+    """
+    if hasattr(creds, "users") and callable(getattr(creds, "users")):
+        return creds
+    cache_key = f"svc_{id(creds)}"
+    if hasattr(_service_cache, cache_key):
+        return getattr(_service_cache, cache_key)
+    svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    setattr(_service_cache, cache_key, svc)
+    return svc
+
+
+def clear_service_cache():
+    """Clear all cached Gmail service instances for the current thread."""
+    for key in list(_service_cache.__dict__.keys()):
+        delattr(_service_cache, key)
+
+
 def get_gmail_service(user_email: str = None):
     """
     Build and return a Gmail API service instance for a specific user.
@@ -60,6 +80,56 @@ def get_gmail_service(user_email: str = None):
     # Cache for this thread
     setattr(_service_cache, cache_key, service)
     return service
+
+
+def get_gmail_service_cached(user_email: str = None):
+    """
+    Thread-local Gmail service cache with token expiry check and refresh.
+    Step 4b perf/batching.
+    """
+    if not user_email:
+        return get_gmail_service(user_email)
+
+    cache_key = f"service_cached_{user_email}"
+    if hasattr(_service_cache, cache_key):
+        entry = getattr(_service_cache, cache_key)
+        if isinstance(entry, tuple) and len(entry) == 2:
+            svc, creds = entry
+            if creds is None:
+                return svc
+            try:
+                import datetime
+                needs_refresh = False
+                if getattr(creds, "expired", False) is True:
+                    needs_refresh = True
+                else:
+                    expiry = getattr(creds, "expiry", None)
+                    if expiry is not None and isinstance(expiry, datetime.datetime):
+                        now = datetime.datetime.utcnow() if expiry.tzinfo is None else datetime.datetime.now(datetime.timezone.utc)
+                        if (expiry - now).total_seconds() < 300:
+                            needs_refresh = True
+
+                if needs_refresh and hasattr(creds, "refresh_token") and creds.refresh_token:
+                    from google.auth.transport.requests import Request
+                    creds.refresh(Request())
+                    from auth import save_token
+                    save_token(creds, user_email)
+                    logger.info(f"[GMAIL] Token refreshed for cached service: {user_email}")
+                return svc
+            except Exception as e:
+                logger.info(f"[GMAIL] Error checking cached token for {user_email}: {e}")
+                if hasattr(_service_cache, cache_key):
+                    delattr(_service_cache, cache_key)
+
+    svc = get_gmail_service(user_email)
+    if not svc:
+        return None
+    try:
+        creds = get_credentials(user_email)
+    except Exception:
+        creds = None
+    setattr(_service_cache, cache_key, (svc, creds))
+    return svc
 
 
 def fetch_emails(limit: int = 50, page_token: str | None = None, user_email: str = None) -> dict:
@@ -180,7 +250,7 @@ def _get_email_details_batch_threadsafe(creds, email_ids: list[str]) -> list[dic
     instead of one per message).
     """
     try:
-        svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        svc = _get_service_for_thread(creds)
         return _get_email_details_batch(svc, email_ids)
     except Exception as e:
         logger.info(f"[GMAIL] Batch fetch failed for chunk of {len(email_ids)}: {e}")
@@ -254,7 +324,7 @@ def _get_email_details_threadsafe(creds, email_id: str) -> dict | None:
     to avoid httplib2 shared-connection deadlocks.
     """
     try:
-        svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        svc = _get_service_for_thread(creds)
         return _get_email_details(svc, email_id)
     except Exception as e:
         logger.info(f"[GMAIL] Thread-safe fetch failed for {email_id}: {e}")
@@ -474,16 +544,12 @@ def _get_email_bodies_batch(creds, email_ids: list[str]) -> dict[str, str]:
 
     import time
 
-    # Build per-worker Gmail service instance if creds is an OAuth credentials object;
-    # or use directly if a service mock/instance was passed.
-    if hasattr(creds, "users") and callable(getattr(creds, "users")):
-        service = creds
-    else:
-        try:
-            service = build("gmail", "v1", credentials=creds, cache_discovery=False)
-        except Exception as e:
-            logger.info(f"[GMAIL] Failed to build Gmail service for batch bodies: {e}")
-            return {mid: "" for mid in email_ids}
+    # Build or reuse per-worker Gmail service instance
+    try:
+        service = _get_service_for_thread(creds)
+    except Exception as e:
+        logger.info(f"[GMAIL] Failed to build Gmail service for batch bodies: {e}")
+        return {mid: "" for mid in email_ids}
 
     results: dict[str, dict] = {}
     pending_ids = list(email_ids)
@@ -664,10 +730,9 @@ def get_or_create_label(user_email: str, label_name: str, user_id: int, gmail_la
 def apply_label(user_email: str, email_id: str, label_id: str):
     """
     Apply a Gmail label to a specific email.
-    Builds a thread-local Gmail service object to ensure thread safety.
+    Builds or reuses a thread-local Gmail service object to ensure thread safety.
     """
-    # Build fresh service per call for thread safety (httplib2.Http is not thread-safe)
-    service = get_gmail_service(user_email)
+    service = get_gmail_service_cached(user_email)
     if not service:
         raise RuntimeError("Gmail service unavailable")
     service.users().messages().modify(
@@ -685,10 +750,9 @@ def change_label(user_email: str, email_id: str, old_label_id: str | None, new_l
     """
     Replace one Gmail label with another on an email.
     Removes old_label_id (if provided) and adds new_label_id in a single modify() call.
-    Builds a thread-local Gmail service object to ensure thread safety.
+    Builds or reuses a thread-local Gmail service object to ensure thread safety.
     """
-    # Build fresh service per call for thread safety (httplib2.Http is not thread-safe)
-    service = get_gmail_service(user_email)
+    service = get_gmail_service_cached(user_email)
     if not service:
         logger.info(f"[GMAIL] Cannot change label: service unavailable for {user_email}")
         return
@@ -717,6 +781,7 @@ SYNC_BATCH = int(os.environ.get("SYNC_BATCH", "1"))
 FETCH_BATCH = int(os.environ.get("FETCH_BATCH", "1"))
 FETCH_BATCH_SIZE = int(os.environ.get("FETCH_BATCH_SIZE", "25"))
 FETCH_BATCH_PARALLEL = int(os.environ.get("FETCH_BATCH_PARALLEL", "2"))
+URL_AI_OVERLAP = int(os.environ.get("URL_AI_OVERLAP", "0"))
 
 
 def sync_labels_batch(user_id: int, user_email: str, gmail_labels_cache: dict[str, str],
@@ -756,8 +821,8 @@ def sync_labels_batch(user_id: int, user_email: str, gmail_labels_cache: dict[st
     if not rows:
         return {'applied': 0, 'failed': 0, 'errors': []}
 
-    # 2. Build ONE Gmail service for the whole batch
-    service = get_gmail_service(user_email)
+    # 2. Build or reuse ONE Gmail service for the whole batch
+    service = get_gmail_service_cached(user_email)
     if not service:
         return {'applied': 0, 'failed': len(email_ids),
                 'errors': [{'email_id': 'all', 'error': 'Gmail service unavailable'}]}
@@ -1557,6 +1622,49 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                     "threat_detected" if url_threat_confirmed else
                     "unavailable" if url_scan_unavailable else "completed"
                 )
+            elif URL_AI_OVERLAP and precomputed_ai_result is None:
+                # Step 4c: Parallelize URL scanning and AI call
+                urls = list(dict.fromkeys(await asyncio.to_thread(extract_urls, body)))
+                urls_total = len(urls)
+                selected_urls = urls[:MAX_URLS_SCANNED]
+
+                from security import scan_urls_batch
+                t_url_start = time.perf_counter()
+
+                scan_task = asyncio.create_task(scan_urls_batch(selected_urls, email_id, url_client))
+
+                async def _ai_early():
+                    if ai_calls_tracker is not None:
+                        ai_calls_tracker[0] += 1
+                    p = classification_prompt.format(
+                        sender=sender, subject=subject, body=_analysis_text(body)[:6000],
+                        url_threat_confirmed=False,
+                        url_scan_unavailable=False,
+                        available_labels=", ".join(available_label_names),
+                    )
+                    return await ai_router.analyze_json(p)
+
+                ai_early_task = asyncio.create_task(_ai_early())
+                scan_results_dict, early_ai_res = await asyncio.gather(scan_task, ai_early_task)
+                t_url = time.perf_counter() - t_url_start
+
+                url_scan_unavailable = len(selected_urls) < urls_total
+                for url, result in scan_results_dict.items():
+                    if result.get("scan_failed") or result.get("is_safe") is None:
+                        url_scan_unavailable = True
+                        continue
+                    urls_checked += 1
+                    if result.get("is_safe") == 0 and result.get("threat_type"):
+                        url_threat_confirmed = True
+
+                url_scan_status = (
+                    "threat_detected" if url_threat_confirmed else
+                    "not_applicable" if not urls_total else
+                    "unavailable" if not urls_checked else
+                    "partial" if url_scan_unavailable else "completed"
+                )
+
+                precomputed_ai_result = early_ai_res
             else:
                 t_url_start = time.perf_counter()
                 urls = list(dict.fromkeys(await asyncio.to_thread(extract_urls, body)))
@@ -1711,7 +1819,12 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             if category_status == "complete":
                 category_status = "completed"
             label = match if match and category_status == "completed" else "Unknown"
-            label_id = get_label_id_by_name(user_id, label) if label != "Unknown" else None
+            if label != "Unknown":
+                label_id = label_id_map.get(label.casefold()) if label_id_map else None
+                if label_id is None:
+                    label_id = get_label_id_by_name(user_id, label)
+            else:
+                label_id = None
             if isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 100:
                 raise ValueError("No valid security assessment")
             indicators = routed.get("scam_indicators", [])
@@ -1994,6 +2107,7 @@ async def label_only_pipeline(limit: int = None, user_id: int = None, user_email
     # Cache labels once per bulk run (instead of per-email DB query)
     available_labels_list = await asyncio.to_thread(get_labels, user_id)
     available_label_names = [lbl["label_name"] for lbl in available_labels_list]
+    label_id_by_name = {lbl["label_name"].casefold(): lbl["label_id"] for lbl in available_labels_list}
 
     async with httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(max_connections=50)) as url_client:
         yield {"type": "initializing", "message": "Starting AI analysis..."}
@@ -2090,6 +2204,7 @@ async def label_only_pipeline(limit: int = None, user_id: int = None, user_email
                         available_label_names=available_label_names,
                         gmail_labels_cache=gmail_labels_cache,
                         update_mode=True,
+                        label_id_map=label_id_by_name,
                         ai_calls_tracker=None,  # tracked at batch level
                         gmail_calls_tracker=pipeline_gmail_calls,
                         precomputed_ai_result=ai_map.get(em["id"]),
@@ -2129,6 +2244,7 @@ async def label_only_pipeline(limit: int = None, user_id: int = None, user_email
                     available_label_names=available_label_names,
                     gmail_labels_cache=gmail_labels_cache,
                     update_mode=True,
+                    label_id_map=label_id_by_name,
                     ai_calls_tracker=pipeline_ai_calls,
                     gmail_calls_tracker=pipeline_gmail_calls,
                 ))
