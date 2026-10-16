@@ -1172,8 +1172,21 @@ async def apply_all_pending(request: Request, user: dict = Depends(require_auth)
         
         return applied, failed, errors
     
+    import uuid
+    import time
+    t_sync_start = time.perf_counter()
+    sync_run_id = f"sync-{uuid.uuid4().hex[:8]}"
+
     # Run the blocking batch processing in a thread pool
     applied, failed, errors = await asyncio.to_thread(_apply_batch)
+
+    wall = time.perf_counter() - t_sync_start
+    total_emails = applied + failed
+    emails_per_min = (total_emails / wall * 60) if wall > 0 else 0.0
+    sync_gmail_calls = 1 + (applied + failed) * 2  # 1 list + 2 per email in per-email mode
+    summary_msg = f"[RUN_SUMMARY] run_id={sync_run_id} emails={total_emails} wall={wall:.2f}s emails_per_min={emails_per_min:.1f} ai_calls=0 gmail_calls={sync_gmail_calls}"
+    logger.info(summary_msg)
+    print(summary_msg)
 
     return {
         "success": True,

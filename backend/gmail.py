@@ -1149,7 +1149,10 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                        url_semaphore: asyncio.Semaphore,
                        available_label_names: list[str],
                        gmail_labels_cache: dict[str, str],
-                       update_mode: bool = False) -> dict:
+                       update_mode: bool = False,
+                       label_id_map: dict[str, int] = None,
+                       ai_calls_tracker: list[int] = None,
+                       gmail_calls_tracker: list[int] = None) -> dict:
     """
     Persist a suggestion and its evidence; Gmail changes require explicit approval.
     Phase 1 Task 2: Track in-flight emails to prevent concurrent analysis.
@@ -1202,6 +1205,8 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                 return {**base, "status": "skipped", "label": "", "scam_score": None, "is_quarantined": 0}
             if not body:
                 t_body_start = time.perf_counter()
+                if gmail_calls_tracker is not None:
+                    gmail_calls_tracker[0] += 1
                 # Build a thread-local service: httplib2 transports cannot be shared by workers.
                 # Phase 1 Task 4: Offload blocking service build to thread pool
                 service = await asyncio.to_thread(get_gmail_service, user_email)
@@ -1282,6 +1287,8 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                 V2_ROUTER_AVAILABLE = False
 
             async def run_ai_cascade():
+                if ai_calls_tracker is not None:
+                    ai_calls_tracker[0] += 1
                 prompt = classification_prompt.format(
                     sender=sender, subject=subject, body=_analysis_text(body)[:6000],
                     url_threat_confirmed=url_threat_confirmed,
@@ -1351,6 +1358,8 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             if match is None and isinstance(score, int) and not isinstance(score, bool) and 0 <= score <= 100:
                 # Label unusable but score valid: ONE tiny follow-up call for the label only.
                 try:
+                    if ai_calls_tracker is not None:
+                        ai_calls_tracker[0] += 1
                     match = await ai_router.label_only(
                         sender, subject, _analysis_text(body)[:1500], available_label_names)
                 except Exception as label_error:
@@ -1531,7 +1540,7 @@ async def fetch_only_pipeline(limit: int = 50, user_id: int = None, user_email: 
     yield {"type": "complete", "fetched": saved_count, "skipped": skipped_count}
 
 
-async def label_only_pipeline(limit: int = None, user_id: int = None, user_email: str = None, email_ids: list[str] = None):
+async def label_only_pipeline(limit: int = None, user_id: int = None, user_email: str = None, email_ids: list[str] = None, run_id: str = None):
     """
     Read status='fetched' emails from DB and run AI analysis.
     Updates rows to status='labeled'. Yields SSE progress events.
@@ -1541,10 +1550,17 @@ async def label_only_pipeline(limit: int = None, user_id: int = None, user_email
         user_id: User ID for ownership check
         user_email: User's email address
         email_ids: Optional list of specific email IDs to process (exact retry targets)
+        run_id: Optional tracking identifier for run summary
     """
+    import uuid
     from ai_router import ai_router, CLASSIFICATION_PROMPT, ANALYZE_CONCURRENCY
     from database import get_emails_by_status, get_emails_by_ids
     import httpx
+
+    run_id = run_id or f"lbl-{uuid.uuid4().hex[:8]}"
+    t_pipeline_start = time.perf_counter()
+    pipeline_ai_calls = [0]
+    pipeline_gmail_calls = [1]  # 1 for service.users().labels().list()
 
     if user_email is None and user_id is not None:
         user_email = get_user_email_by_id(user_id)
@@ -1599,6 +1615,8 @@ async def label_only_pipeline(limit: int = None, user_id: int = None, user_email
                 available_label_names=available_label_names,
                 gmail_labels_cache=gmail_labels_cache,
                 update_mode=True,
+                ai_calls_tracker=pipeline_ai_calls,
+                gmail_calls_tracker=pipeline_gmail_calls,
             ))
             for email in fetched_emails
         ]
@@ -1636,5 +1654,14 @@ async def label_only_pipeline(limit: int = None, user_id: int = None, user_email
         
         await asyncio.gather(*tracking_tasks)
         
+        wall = time.perf_counter() - t_pipeline_start
+        total_emails = analyzed_count + failed_count
+        emails_per_min = (total_emails / wall * 60) if wall > 0 else 0.0
+        ai_calls = pipeline_ai_calls[0]
+        gmail_calls = pipeline_gmail_calls[0]
+        summary_msg = f"[RUN_SUMMARY] run_id={run_id} emails={total_emails} wall={wall:.2f}s emails_per_min={emails_per_min:.1f} ai_calls={ai_calls} gmail_calls={gmail_calls}"
+        logger.info(summary_msg)
+        print(summary_msg)
+
         yield {"type": "complete", "analyzed": analyzed_count, "failed": failed_count, "results": results}
 
