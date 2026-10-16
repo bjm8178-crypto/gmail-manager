@@ -1481,7 +1481,8 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                        update_mode: bool = False,
                        label_id_map: dict[str, int] = None,
                        ai_calls_tracker: list[int] = None,
-                       gmail_calls_tracker: list[int] = None) -> dict:
+                       gmail_calls_tracker: list[int] = None,
+                       precomputed_ai_result: dict = None) -> dict:
     """
     Persist a suggestion and its evidence; Gmail changes require explicit approval.
     Phase 1 Task 2: Track in-flight emails to prevent concurrent analysis.
@@ -1549,32 +1550,40 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
 
             # Phase 1 Task 4: Offload HTML parsing (BeautifulSoup) to thread pool
             # Phase 3 Task 10: Batch URL scanning (single Safe Browsing API call)
-            t_url_start = time.perf_counter()
-            urls = list(dict.fromkeys(await asyncio.to_thread(extract_urls, body)))
-            urls_total = len(urls)
-            selected_urls = urls[:MAX_URLS_SCANNED]
-            
-            # Batch scan all URLs in one request (replaces gather + per-URL calls)
-            from security import scan_urls_batch
-            scan_results_dict = await scan_urls_batch(selected_urls, email_id, url_client)
-            t_url = time.perf_counter() - t_url_start
-            
-            # Phase 3 Task 11: URL scan failures do NOT downgrade analysis_status
-            url_scan_unavailable = len(selected_urls) < urls_total  # capped URLs
-            for url, result in scan_results_dict.items():
-                if result.get("scan_failed") or result.get("is_safe") is None:
-                    url_scan_unavailable = True
-                    continue
-                urls_checked += 1
-                if result.get("is_safe") == 0 and result.get("threat_type"):
-                    url_threat_confirmed = True
-            
-            url_scan_status = (
-                "threat_detected" if url_threat_confirmed else
-                "not_applicable" if not urls_total else
-                "unavailable" if not urls_checked else
-                "partial" if url_scan_unavailable else "completed"
-            )
+            if email.get("url_threat_confirmed") is not None:
+                url_threat_confirmed = email["url_threat_confirmed"]
+                url_scan_unavailable = email.get("url_scan_unavailable", False)
+                url_scan_status = (
+                    "threat_detected" if url_threat_confirmed else
+                    "unavailable" if url_scan_unavailable else "completed"
+                )
+            else:
+                t_url_start = time.perf_counter()
+                urls = list(dict.fromkeys(await asyncio.to_thread(extract_urls, body)))
+                urls_total = len(urls)
+                selected_urls = urls[:MAX_URLS_SCANNED]
+                
+                # Batch scan all URLs in one request (replaces gather + per-URL calls)
+                from security import scan_urls_batch
+                scan_results_dict = await scan_urls_batch(selected_urls, email_id, url_client)
+                t_url = time.perf_counter() - t_url_start
+                
+                # Phase 3 Task 11: URL scan failures do NOT downgrade analysis_status
+                url_scan_unavailable = len(selected_urls) < urls_total  # capped URLs
+                for url, result in scan_results_dict.items():
+                    if result.get("scan_failed") or result.get("is_safe") is None:
+                        url_scan_unavailable = True
+                        continue
+                    urls_checked += 1
+                    if result.get("is_safe") == 0 and result.get("threat_type"):
+                        url_threat_confirmed = True
+                
+                url_scan_status = (
+                    "threat_detected" if url_threat_confirmed else
+                    "not_applicable" if not urls_total else
+                    "unavailable" if not urls_checked else
+                    "partial" if url_scan_unavailable else "completed"
+                )
 
             # Phase 5: Attachment scanning
             from attachment_scanner import scan_attachments
@@ -1616,6 +1625,8 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                 V2_ROUTER_AVAILABLE = False
 
             async def run_ai_cascade():
+                if precomputed_ai_result is not None:
+                    return precomputed_ai_result
                 if ai_calls_tracker is not None:
                     ai_calls_tracker[0] += 1
                 prompt = classification_prompt.format(
@@ -2000,58 +2011,158 @@ async def label_only_pipeline(limit: int = None, user_id: int = None, user_email
         total = len(fetched_emails)
         yield {"type": "progress", "current": 0, "total": total}
 
-        tasks = [
-            asyncio.create_task(_analyze_one(
-                email=email,
-                semaphore=semaphore,
-                ai_router=ai_router,
-                classification_prompt=CLASSIFICATION_PROMPT,
-                user_id=user_id,
-                user_email=user_email,
-                service=service,
-                url_client=url_client,
-                url_semaphore=url_semaphore,
-                available_label_names=available_label_names,
-                gmail_labels_cache=gmail_labels_cache,
-                update_mode=True,
-                ai_calls_tracker=pipeline_ai_calls,
-                gmail_calls_tracker=pipeline_gmail_calls,
-            ))
-            for email in fetched_emails
-        ]
+        from ai_router import AI_BATCH_SIZE
 
-        done_queue = asyncio.Queue()
-        
-        async def track_completion(task, idx):
-            result = await task
-            await done_queue.put((idx, result))
-        
-        tracking_tasks = [asyncio.create_task(track_completion(t, i)) for i, t in enumerate(tasks)]
-        
         analyzed_count = 0
         failed_count = 0
         results = []
-        
-        for _ in range(len(tasks)):
-            idx, result = await done_queue.get()
+
+        if AI_BATCH_SIZE > 1:
+            # Step 3 perf/batching: Process in chunks of AI_BATCH_SIZE
+            from security import extract_urls, scan_urls_batch
+
+            chunks = [
+                fetched_emails[i:i + AI_BATCH_SIZE]
+                for i in range(0, len(fetched_emails), AI_BATCH_SIZE)
+            ]
+
+            for chunk in chunks:
+                # Stage A: Run URL scans concurrently for each email in chunk
+                async def _scan_urls_for_email(em):
+                    em_body = em.get("body", "")
+                    if not em_body:
+                        return
+                    urls = list(dict.fromkeys(await asyncio.to_thread(extract_urls, em_body)))
+                    selected = urls[:MAX_URLS_SCANNED]
+                    scan_dict = await scan_urls_batch(selected, em["id"], url_client)
+                    threat = False
+                    checked = 0
+                    unavail = len(selected) < len(urls)
+                    for u, r in scan_dict.items():
+                        if r.get("scan_failed") or r.get("is_safe") is None:
+                            unavail = True
+                            continue
+                        checked += 1
+                        if r.get("is_safe") == 0 and r.get("threat_type"):
+                            threat = True
+                    em["url_threat_confirmed"] = threat
+                    em["url_scan_unavailable"] = unavail
+
+                await asyncio.gather(*[_scan_urls_for_email(em) for em in chunk])
+
+                # Stage B: One batch AI call for up to AI_BATCH_SIZE emails
+                items = [
+                    {
+                        "id": em["id"],
+                        "subject": em.get("subject", ""),
+                        "sender": em.get("sender", ""),
+                        "snippet": em.get("snippet", ""),
+                        "body": em.get("body", ""),
+                        "url_threat_confirmed": em.get("url_threat_confirmed", False),
+                        "url_scan_unavailable": em.get("url_scan_unavailable", False),
+                    }
+                    for em in chunk
+                ]
+                batch_res = await ai_router.analyze_batch(items, available_label_names)
+                if pipeline_ai_calls is not None:
+                    pipeline_ai_calls[0] += 1
+
+                ai_map = {}
+                for res_item in batch_res.get("results", []):
+                    if isinstance(res_item, dict) and "id" in res_item:
+                        ai_map[res_item["id"]] = {
+                            "data": res_item,
+                            "provider_used": batch_res.get("provider_used"),
+                        }
+
+                # Stage C: Run _analyze_one for each email using that email's AI result
+                chunk_tasks = [
+                    asyncio.create_task(_analyze_one(
+                        email=em,
+                        semaphore=semaphore,
+                        ai_router=ai_router,
+                        classification_prompt=CLASSIFICATION_PROMPT,
+                        user_id=user_id,
+                        user_email=user_email,
+                        service=service,
+                        url_client=url_client,
+                        url_semaphore=url_semaphore,
+                        available_label_names=available_label_names,
+                        gmail_labels_cache=gmail_labels_cache,
+                        update_mode=True,
+                        ai_calls_tracker=None,  # tracked at batch level
+                        gmail_calls_tracker=pipeline_gmail_calls,
+                        precomputed_ai_result=ai_map.get(em["id"]),
+                    ))
+                    for em in chunk
+                ]
+
+                chunk_results = await asyncio.gather(*chunk_tasks)
+                for result in chunk_results:
+                    if result.get("status") == "failed":
+                        failed_count += 1
+                    elif result.get("status") == "success":
+                        analyzed_count += 1
+                        results.append(result)
+
+                    yield {
+                        "type": "email_done",
+                        "current": analyzed_count + failed_count,
+                        "total": total,
+                        "email_id": result.get("email_id"),
+                        "subject": result.get("subject"),
+                        "label": result.get("label", ""),
+                        "scam_score": result.get("scam_score", 0),
+                    }
+        else:
+            tasks = [
+                asyncio.create_task(_analyze_one(
+                    email=email,
+                    semaphore=semaphore,
+                    ai_router=ai_router,
+                    classification_prompt=CLASSIFICATION_PROMPT,
+                    user_id=user_id,
+                    user_email=user_email,
+                    service=service,
+                    url_client=url_client,
+                    url_semaphore=url_semaphore,
+                    available_label_names=available_label_names,
+                    gmail_labels_cache=gmail_labels_cache,
+                    update_mode=True,
+                    ai_calls_tracker=pipeline_ai_calls,
+                    gmail_calls_tracker=pipeline_gmail_calls,
+                ))
+                for email in fetched_emails
+            ]
+
+            done_queue = asyncio.Queue()
             
-            if result.get("status") == "failed":
-                failed_count += 1
-            elif result.get("status") == "success":
-                analyzed_count += 1
-                results.append(result)
+            async def track_completion(task, idx):
+                result = await task
+                await done_queue.put((idx, result))
             
-            yield {
-                "type": "email_done",
-                "current": analyzed_count + failed_count,
-                "total": total,
-                "email_id": result.get("email_id"),
-                "subject": result.get("subject"),
-                "label": result.get("label", ""),
-                "scam_score": result.get("scam_score", 0),
-            }
-        
-        await asyncio.gather(*tracking_tasks)
+            tracking_tasks = [asyncio.create_task(track_completion(t, i)) for i, t in enumerate(tasks)]
+            
+            for _ in range(len(tasks)):
+                idx, result = await done_queue.get()
+                
+                if result.get("status") == "failed":
+                    failed_count += 1
+                elif result.get("status") == "success":
+                    analyzed_count += 1
+                    results.append(result)
+                
+                yield {
+                    "type": "email_done",
+                    "current": analyzed_count + failed_count,
+                    "total": total,
+                    "email_id": result.get("email_id"),
+                    "subject": result.get("subject"),
+                    "label": result.get("label", ""),
+                    "scam_score": result.get("scam_score", 0),
+                }
+            
+            await asyncio.gather(*tracking_tasks)
         
         wall = time.perf_counter() - t_pipeline_start
         total_emails = analyzed_count + failed_count

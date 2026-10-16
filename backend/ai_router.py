@@ -156,6 +156,7 @@ AI_BREAKER_MAX_RETRY_AFTER = float(os.getenv("AI_BREAKER_MAX_RETRY_AFTER", "300"
 
 # Email-analysis concurrency (replaces the hard-coded Semaphore(2)).
 ANALYZE_CONCURRENCY = max(1, int(os.getenv("ANALYZE_CONCURRENCY", "3")))
+AI_BATCH_SIZE = max(1, int(os.getenv("AI_BATCH_SIZE", "1")))
 
 # Keyless providers are opt-in: Kilo returns 401 and LLM7 is off by default.
 ENABLE_KILO = os.getenv("ENABLE_KILO", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -249,6 +250,43 @@ URL Scan Unavailable (network/API failure): {url_scan_unavailable}
 Available Labels: {available_labels}
 
 Remember: Copy one label from the Available Labels list EXACTLY as written above.
+"""
+
+CLASSIFICATION_BATCH_PROMPT = """You are an email classification and scam detection AI. You will be given a list of emails with their ID, sender, subject, body, URL security scan results, and a list of available classification labels.
+
+Your job is to analyze each email and return a JSON array containing an analysis object for every email in the input list, in the exact same order.
+
+For each email:
+1. Classify the email into exactly ONE label from the provided available_labels list. You MUST copy the label name EXACTLY as it appears in the list, character-for-character, with exact capitalization and spacing. Do not paraphrase or use similar words.
+2. Assign a scam probability score from 0 to 100 where 0 means definitely not a scam and 100 means definitely a scam.
+3. List the specific phishing or scam indicators you detected. If none, return an empty list.
+4. Provide a one-sentence reasoning for your classification.
+
+IMPORTANT: The "label" field in your JSON response must be an EXACT MATCH (including capitalization) to one of the labels in the Available Labels list below. If none fit perfectly, choose the closest match from the list and copy its exact spelling.
+
+Use these rules when deciding the scam_score:
+- If url_threat_confirmed is true, a malicious URL was confirmed by Google Safe Browsing - the scam_score must be at least 70.
+- If url_scan_unavailable is true, URL scanning failed (network error, timeout, etc.) - treat this as NEUTRAL information. Do not increase the score solely because scanning failed. Base your score on the email's content, sender, and other indicators.
+- If the email contains urgency language such as "act now", "limited time", "your account will be suspended", "verify immediately", or similar phrases, add 20 to the base score.
+- If the sender domain does not match the brand or company name mentioned in the subject or body, add 15 to the base score.
+- If the email offers prizes, lottery winnings, inheritance, or unexpected money, add 25 to the base score.
+- If the email asks for passwords, credit card numbers, OTP codes, or personal identification numbers, add 30 to the base score.
+- Legitimate system-generated emails such as OTP codes, order confirmations, and bank transaction alerts from matching sender domains should receive a scam_score of 5 or below.
+
+You must respond with ONLY a valid JSON array of objects. Do not include markdown, backticks, or any text outside the JSON array.
+Each object must have exactly these five fields:
+- "id": string (the exact email ID provided in the input)
+- "label": string (one value copied verbatim from the Available Labels list below)
+- "scam_score": integer (0-100)
+- "scam_indicators": array of strings
+- "reasoning": string
+
+Available Labels: {available_labels}
+
+Emails to analyze:
+{emails_input}
+
+Remember: Return a JSON array of objects with the exact matching "id" for each email. Copy labels EXACTLY.
 """
 
 REWRITE_PROMPT = """
@@ -1091,9 +1129,9 @@ class AIRouter:
                 "{0} timed out ({1:.0f}s)".format(name, AI_PROVIDER_TIMEOUT), transient=True
             )
 
-    async def _run_cascade(self, prompt, parse_json):
+    async def _run_cascade(self, prompt, parse_json=True, validate_fn=None):
         """
-        Shared cascade loop for both analyze() and analyze_json().
+        Shared cascade loop for analyze(), analyze_json(), and analyze_batch().
 
         Phase 2 Task 5: only startup-configured providers are attempted.
         Phase 2 Task 6: overall per-email AI deadline + Retry-After honoured.
@@ -1125,7 +1163,12 @@ class AIRouter:
                         timeout=remaining,
                     )
                 if parse_json:
-                    data = self._parse_json_response(response)
+                    if parse_json == "array":
+                        data = self._parse_json_array_response(response)
+                    else:
+                        data = self._parse_json_response(response)
+                    if validate_fn:
+                        validate_fn(data)
                     await AI_BREAKER.record_success(name)
                     logger.info("[AI] {0} responded successfully with valid JSON.".format(name))
                     return {"data": data, "provider_used": name}
@@ -1169,6 +1212,24 @@ class AIRouter:
                 raise ValueError("AI response was not valid JSON")
             return json.loads(cleaned[jstart:jend + 1])
 
+    @staticmethod
+    def _parse_json_array_response(response):
+        """Parse a provider response into a JSON array, tolerating fences and prose."""
+        cleaned = response.strip().replace("```json", "").replace("```", "").strip()
+        try:
+            res = json.loads(cleaned)
+            if isinstance(res, list):
+                return res
+        except json.JSONDecodeError:
+            pass
+        jstart = cleaned.find("[")
+        jend = cleaned.rfind("]")
+        if jstart >= 0 and jend > jstart:
+            res = json.loads(cleaned[jstart:jend + 1])
+            if isinstance(res, list):
+                return res
+        raise ValueError("AI response was not a valid JSON array")
+
     async def analyze(self, prompt):
         """Run a prompt through the configured provider cascade."""
         return await self._run_cascade(prompt, parse_json=False)
@@ -1176,6 +1237,81 @@ class AIRouter:
     async def analyze_json(self, prompt):
         """Run the cascade and continue past providers with invalid JSON."""
         return await self._run_cascade(prompt, parse_json=True)
+
+    async def analyze_batch(self, items: list[dict], available_labels: list[str]) -> dict:
+        """
+        Analyze a batch of emails in a single AI call.
+        Sends items (id, subject, sender, snippet, body up to 2000 chars) in one prompt.
+        Validates array length matches items length and every item ID is present.
+        Falls back to individual analyze_json calls if batch call fails or returns malformed JSON.
+        Step 3 perf/batching.
+        """
+        if not items:
+            return {"results": [], "provider_used": None}
+
+        formatted_items = []
+        for it in items:
+            body_text = (it.get("body") or it.get("snippet") or "")[:2000]
+            formatted_items.append(
+                f"--- Email ID: {it['id']} ---\n"
+                f"Sender: {it.get('sender', '')}\n"
+                f"Subject: {it.get('subject', '')}\n"
+                f"Body: {body_text}\n"
+                f"URL Threat Confirmed: {it.get('url_threat_confirmed', False)}\n"
+                f"URL Scan Unavailable: {it.get('url_scan_unavailable', False)}"
+            )
+        emails_input = "\n\n".join(formatted_items)
+        prompt = CLASSIFICATION_BATCH_PROMPT.format(
+            available_labels=", ".join(available_labels),
+            emails_input=emails_input,
+        )
+
+        expected_ids = {it["id"] for it in items}
+
+        def _validate_batch(data):
+            if not isinstance(data, list):
+                raise ValueError("Response is not a list")
+            if len(data) != len(items):
+                raise ValueError(f"Batch response length {len(data)} != items {len(items)}")
+            result_ids = {r.get("id") for r in data if isinstance(r, dict)}
+            if not expected_ids.issubset(result_ids):
+                missing = expected_ids - result_ids
+                raise ValueError(f"Batch response missing IDs: {missing}")
+
+        try:
+            res = await self._run_cascade(prompt, parse_json="array", validate_fn=_validate_batch)
+            if "data" in res and isinstance(res["data"], list):
+                return {"results": res["data"], "provider_used": res.get("provider_used")}
+        except Exception as e:
+            logger.info(f"[AI-BATCH] Batch cascade exception: {e}")
+
+        # Fallback: analyze each item individually
+        logger.info(f"[AI-BATCH] Falling back to individual analyze_json for {len(items)} items")
+        fallback_results = []
+        provider_used = None
+        for item in items:
+            single_prompt = CLASSIFICATION_PROMPT.format(
+                sender=item.get("sender", ""),
+                subject=item.get("subject", ""),
+                body=(item.get("body") or item.get("snippet") or "")[:2000],
+                url_threat_confirmed=item.get("url_threat_confirmed", False),
+                url_scan_unavailable=item.get("url_scan_unavailable", False),
+                available_labels=", ".join(available_labels),
+            )
+            single_res = await self.analyze_json(single_prompt)
+            data = single_res.get("data", {})
+            if single_res.get("provider_used"):
+                provider_used = single_res.get("provider_used")
+            fallback_results.append({
+                "id": item["id"],
+                "label": data.get("label", "Unknown") if isinstance(data, dict) else "Unknown",
+                "scam_score": data.get("scam_score", 0) if isinstance(data, dict) else 0,
+                "scam_indicators": data.get("scam_indicators", []) if isinstance(data, dict) else [],
+                "reasoning": data.get("reasoning", "Fallback single call") if isinstance(data, dict) else "Fallback single call",
+            })
+
+        return {"results": fallback_results, "provider_used": provider_used or "individual_fallback"}
+
 
     async def label_only(self, sender, subject, body, available_labels):
         """
