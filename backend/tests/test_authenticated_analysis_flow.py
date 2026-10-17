@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 import main
 
 
-async def _fake_analysis_pipeline(*, limit, user_id):
+async def _fake_analysis_pipeline(*, limit, user_id, run_id=None, **kwargs):
     yield {"type": "email_done", "email_id": "message-1", "status": "success"}
     yield {"type": "complete", "fetched": 1, "analyzed": 1, "failed": 0}
 

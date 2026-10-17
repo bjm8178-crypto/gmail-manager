@@ -810,8 +810,22 @@ def save_analyzed_email(email_id: str, user_id: int, label_id: int, scam_score: 
             VALUES ({', '.join(['%s'] * len(fields))})
             ON CONFLICT (email_id) DO UPDATE SET {assignments}
             WHERE analyzed_emails.user_id = excluded.user_id
+              AND NOT (analyzed_emails.status = 'labeled'
+                       AND analyzed_emails.scam_score IS NOT NULL
+                       AND excluded.status IN ('failed', 'fetched'))
         """, values)
-        if cursor.rowcount != 1:
+        if cursor.rowcount == 0:
+            _execute(cursor, "SELECT user_id FROM analyzed_emails WHERE email_id = %s", (email_id,))
+            row = cursor.fetchone()
+            owner_id = (row["user_id"] if isinstance(row, dict) else row[0]) if row else None
+            if owner_id == user_id:
+                logger.warning(
+                    f"[DB] Skipped downgrade: {email_id[:12]} already has status=labeled with valid score (attempted status={status})"
+                )
+                conn.commit()
+                return
+            raise ValueError("Email ID belongs to a different account")
+        elif cursor.rowcount != 1:
             raise ValueError("Email ID belongs to a different account")
 
         logger.info(f"[DB] Saved email {email_id[:12]}... label_id={label_id}, scam_score={scam_score}, status={status}, source={source}")
@@ -862,7 +876,11 @@ def update_analyzed_email(email_id: str, label_id: int, scam_score: int,
                  (*values.values(), email_id, user_id, status))
         
         if cursor.rowcount == 0:
-            logger.warning(f"[DB] Skipped downgrade: {email_id[:12]} already has status=labeled with valid score (attempted status={status})")
+            _execute(cursor, "SELECT 1 FROM analyzed_emails WHERE email_id = %s AND user_id = %s", (email_id, user_id))
+            if cursor.fetchone():
+                logger.warning(f"[DB] Skipped downgrade: {email_id[:12]} already has status=labeled with valid score (attempted status={status})")
+            else:
+                logger.warning(f"[DB] Email {email_id[:12]} not found for user {user_id} (update skipped)")
         else:
             logger.info(f"[DB] Updated email {email_id[:12]}... to status={status}, label_id={label_id}, score={scam_score}")
         

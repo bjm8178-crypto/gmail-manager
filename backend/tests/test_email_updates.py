@@ -67,7 +67,7 @@ def test_update_analyzed_email_sql_enforces_owner_scope():
     query, params = mock_execute.call_args.args[1:3]
     normalized_query = " ".join(query.split())
     assert "WHERE email_id = %s AND user_id = %s" in normalized_query
-    assert params[-2:] == ("email-1", 7)
+    assert params[-3:] == ("email-1", 7, "labeled")
 
 
 def test_reanalysis_and_update_mode_are_scoped_by_static_scan():
@@ -78,4 +78,4 @@ def test_reanalysis_and_update_mode_are_scoped_by_static_scan():
     }
 
     assert "user_id=user_id" in source_files["main.py"]
-    assert "update_analyzed_email(email_id=email_id, user_id=user_id" in source_files["gmail.py"]
+    assert "update_analyzed_email, email_id=email_id, user_id=user_id" in source_files["gmail.py"]
