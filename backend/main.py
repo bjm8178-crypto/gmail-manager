@@ -1157,6 +1157,20 @@ async def apply_all_pending(request: Request, user: dict = Depends(require_auth)
     # This prevents blocking the single-worker process during large batches
     def _apply_batch():
         """Synchronous function to process the batch off the event loop."""
+        from gmail import SYNC_BATCH, sync_labels_batch
+
+        if SYNC_BATCH and pending_emails:
+            # Step 1: Use batched batchModify path
+            result = sync_labels_batch(
+                user_id=user_id,
+                user_email=user_email,
+                gmail_labels_cache=gmail_labels_cache,
+                email_ids=pending_emails,
+                per_email_fallback=_sync_label_to_gmail,
+            )
+            return result['applied'], result['failed'], result['errors']
+
+        # Legacy per-email path (SYNC_BATCH=0)
         applied = 0
         failed = 0
         errors = []
@@ -1172,8 +1186,26 @@ async def apply_all_pending(request: Request, user: dict = Depends(require_auth)
         
         return applied, failed, errors
     
+    import uuid
+    import time
+    t_sync_start = time.perf_counter()
+    sync_run_id = f"sync-{uuid.uuid4().hex[:8]}"
+
     # Run the blocking batch processing in a thread pool
     applied, failed, errors = await asyncio.to_thread(_apply_batch)
+
+    wall = time.perf_counter() - t_sync_start
+    total_emails = applied + failed
+    emails_per_min = (total_emails / wall * 60) if wall > 0 else 0.0
+    # Estimate gmail calls: batch mode ~ 1 list + ~1 batchModify per label group; per-email ~ 2 per email
+    from gmail import SYNC_BATCH
+    if SYNC_BATCH:
+        sync_gmail_calls = 1 + max(1, len(set()))  # placeholder; actual counted inside
+    else:
+        sync_gmail_calls = 1 + (applied + failed) * 2
+    summary_msg = f"[RUN_SUMMARY] run_id={sync_run_id} emails={total_emails} wall={wall:.2f}s emails_per_min={emails_per_min:.1f} ai_calls=0 gmail_calls=~batch"
+    logger.info(summary_msg)
+    print(summary_msg)
 
     return {
         "success": True,

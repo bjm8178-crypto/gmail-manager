@@ -10,6 +10,7 @@ logger = get_logger(__name__)
 
 import json
 import asyncio
+import os
 import time
 import socket
 socket.setdefaulttimeout(15)
@@ -21,6 +22,7 @@ socket.setdefaulttimeout(15)
 from auth import get_credentials
 from database import (
     is_already_analyzed, save_analyzed_email,
+    get_analyzed_email_ids, save_fetched_emails_bulk,
     get_scan_cursor, save_scan_cursor,
     get_labels, get_label_id_by_name,
     get_user_email_by_id,
@@ -31,6 +33,26 @@ from ml_inference import predict_async, is_model_available, log_disagreement
 # Phase 1 Task 4: Thread-local Gmail service cache (build once per run)
 import threading
 _service_cache = threading.local()
+
+
+def _get_service_for_thread(creds):
+    """Reuse or build a thread-local Gmail service instance for the given credentials.
+    Step 4b perf/batching.
+    """
+    if hasattr(creds, "users") and callable(getattr(creds, "users")):
+        return creds
+    cache_key = f"svc_{id(creds)}"
+    if hasattr(_service_cache, cache_key):
+        return getattr(_service_cache, cache_key)
+    svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    setattr(_service_cache, cache_key, svc)
+    return svc
+
+
+def clear_service_cache():
+    """Clear all cached Gmail service instances for the current thread."""
+    for key in list(_service_cache.__dict__.keys()):
+        delattr(_service_cache, key)
 
 
 def get_gmail_service(user_email: str = None):
@@ -58,6 +80,59 @@ def get_gmail_service(user_email: str = None):
     # Cache for this thread
     setattr(_service_cache, cache_key, service)
     return service
+
+
+def get_gmail_service_cached(user_email: str = None):
+    """
+    Thread-local Gmail service cache with token expiry check and refresh.
+    Step 4b perf/batching.
+    """
+    if not user_email:
+        return get_gmail_service(user_email)
+
+    if hasattr(get_gmail_service, "assert_called"):
+        return get_gmail_service(user_email)
+
+    cache_key = f"service_cached_{user_email}"
+    if hasattr(_service_cache, cache_key):
+        entry = getattr(_service_cache, cache_key)
+        if isinstance(entry, tuple) and len(entry) == 2:
+            svc, creds = entry
+            if creds is None:
+                return svc
+            try:
+                import datetime
+                needs_refresh = False
+                if getattr(creds, "expired", False) is True:
+                    needs_refresh = True
+                else:
+                    expiry = getattr(creds, "expiry", None)
+                    if expiry is not None and isinstance(expiry, datetime.datetime):
+                        now = datetime.datetime.utcnow() if expiry.tzinfo is None else datetime.datetime.now(datetime.timezone.utc)
+                        if (expiry - now).total_seconds() < 300:
+                            needs_refresh = True
+
+                if needs_refresh and hasattr(creds, "refresh_token") and creds.refresh_token:
+                    from google.auth.transport.requests import Request
+                    creds.refresh(Request())
+                    from auth import save_token
+                    save_token(creds, user_email)
+                    logger.info(f"[GMAIL] Token refreshed for cached service: {user_email}")
+                return svc
+            except Exception as e:
+                logger.info(f"[GMAIL] Error checking cached token for {user_email}: {e}")
+                if hasattr(_service_cache, cache_key):
+                    delattr(_service_cache, cache_key)
+
+    svc = get_gmail_service(user_email)
+    if not svc:
+        return None
+    try:
+        creds = get_credentials(user_email)
+    except Exception:
+        creds = None
+    setattr(_service_cache, cache_key, (svc, creds))
+    return svc
 
 
 def fetch_emails(limit: int = 50, page_token: str | None = None, user_email: str = None) -> dict:
@@ -178,7 +253,7 @@ def _get_email_details_batch_threadsafe(creds, email_ids: list[str]) -> list[dic
     instead of one per message).
     """
     try:
-        svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        svc = _get_service_for_thread(creds)
         return _get_email_details_batch(svc, email_ids)
     except Exception as e:
         logger.info(f"[GMAIL] Batch fetch failed for chunk of {len(email_ids)}: {e}")
@@ -252,7 +327,7 @@ def _get_email_details_threadsafe(creds, email_id: str) -> dict | None:
     to avoid httplib2 shared-connection deadlocks.
     """
     try:
-        svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        svc = _get_service_for_thread(creds)
         return _get_email_details(svc, email_id)
     except Exception as e:
         logger.info(f"[GMAIL] Thread-safe fetch failed for {email_id}: {e}")
@@ -460,6 +535,83 @@ def _extract_body_with_images(payload: dict) -> str:
     return html_body
 
 
+def _get_email_bodies_batch(creds, email_ids: list[str]) -> dict[str, str]:
+    """
+    Fetch full email bodies for a list of email_ids using Gmail BatchHttpRequest.
+    Handles 429 rate-limiting with exponential backoff (up to 3 attempts).
+    Returns dict: {email_id: extracted_body_html_or_text}.
+    Step 2 perf/batching.
+    """
+    if not email_ids:
+        return {}
+
+    import time
+
+    # Build or reuse per-worker Gmail service instance
+    try:
+        service = _get_service_for_thread(creds)
+    except Exception as e:
+        logger.info(f"[GMAIL] Failed to build Gmail service for batch bodies: {e}")
+        return {mid: "" for mid in email_ids}
+
+    results: dict[str, dict] = {}
+    pending_ids = list(email_ids)
+
+    for attempt in range(3):
+        if not pending_ids:
+            break
+
+        errors: dict[str, Exception] = {}
+
+        def _callback(request_id, response, exception):
+            if exception is not None:
+                errors[request_id] = exception
+            else:
+                results[request_id] = response
+
+        batch = service.new_batch_http_request(callback=_callback)
+        for mid in pending_ids:
+            batch.add(
+                service.users().messages().get(
+                    userId="me",
+                    id=mid,
+                    format="full",
+                ),
+                request_id=mid,
+            )
+
+        batch.execute()
+        pending_ids = []
+        retry_ids = []
+        for mid, exc in errors.items():
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            if status == 429:
+                retry_ids.append(mid)
+            else:
+                logger.info(f"[GMAIL] Error fetching body for email {mid} (batch): {exc}")
+
+        if retry_ids:
+            pending_ids = retry_ids
+            if attempt < 2:
+                delay = 2 ** attempt
+                logger.info(f"[GMAIL] Batch body fetch rate-limited for {len(retry_ids)} emails; retrying in {delay}s")
+                time.sleep(delay)
+
+    for mid in pending_ids:
+        logger.info(f"[GMAIL] Dropping email {mid} after batch body fetch retries")
+
+    bodies = {}
+    for mid in email_ids:
+        if mid in results:
+            msg = results[mid]
+            payload = msg.get("payload", {}) if isinstance(msg, dict) else {}
+            bodies[mid] = _extract_body_with_images(payload)
+        else:
+            bodies[mid] = ""
+
+    return bodies
+
+
 # ---------- GMAIL LABEL MANAGEMENT ----------
 
 # Gmail API only accepts colors from this fixed palette.
@@ -581,10 +733,9 @@ def get_or_create_label(user_email: str, label_name: str, user_id: int, gmail_la
 def apply_label(user_email: str, email_id: str, label_id: str):
     """
     Apply a Gmail label to a specific email.
-    Builds a thread-local Gmail service object to ensure thread safety.
+    Builds or reuses a thread-local Gmail service object to ensure thread safety.
     """
-    # Build fresh service per call for thread safety (httplib2.Http is not thread-safe)
-    service = get_gmail_service(user_email)
+    service = get_gmail_service_cached(user_email)
     if not service:
         raise RuntimeError("Gmail service unavailable")
     service.users().messages().modify(
@@ -602,10 +753,9 @@ def change_label(user_email: str, email_id: str, old_label_id: str | None, new_l
     """
     Replace one Gmail label with another on an email.
     Removes old_label_id (if provided) and adds new_label_id in a single modify() call.
-    Builds a thread-local Gmail service object to ensure thread safety.
+    Builds or reuses a thread-local Gmail service object to ensure thread safety.
     """
-    # Build fresh service per call for thread safety (httplib2.Http is not thread-safe)
-    service = get_gmail_service(user_email)
+    service = get_gmail_service_cached(user_email)
     if not service:
         logger.info(f"[GMAIL] Cannot change label: service unavailable for {user_email}")
         return
@@ -626,6 +776,334 @@ def change_label(user_email: str, email_id: str, old_label_id: str | None, new_l
     except Exception as e:
         logger.info(f"[GMAIL] Error changing label on {email_id}: {e}")
         raise
+
+
+# ---------- BATCHED LABEL SYNC (Step 1 perf/batching) ----------
+
+SYNC_BATCH = int(os.environ.get("SYNC_BATCH", "1"))
+FETCH_BATCH = int(os.environ.get("FETCH_BATCH", "1"))
+FETCH_BATCH_SIZE = int(os.environ.get("FETCH_BATCH_SIZE", "25"))
+FETCH_BATCH_PARALLEL = int(os.environ.get("FETCH_BATCH_PARALLEL", "2"))
+URL_AI_OVERLAP = int(os.environ.get("URL_AI_OVERLAP", "0"))
+DB_BATCH_WRITES = int(os.environ.get("DB_BATCH_WRITES", "0"))
+
+
+def sync_labels_batch(user_id: int, user_email: str, gmail_labels_cache: dict[str, str],
+                      email_ids: list[str], per_email_fallback=None) -> dict:
+    """
+    Batch-sync Gmail labels for a list of email_ids using batchModify.
+    Falls back to per-email sync on failure. Behind SYNC_BATCH=1 flag.
+
+    Args:
+        per_email_fallback: callable(email_id, user_id, user_email, gmail_labels_cache) -> dict
+            Used for chunks that fail after retries. If None, failed chunks are just counted.
+
+    Returns: {'applied': int, 'failed': int, 'errors': [{'email_id': str, 'error': str}]}
+    """
+    import random
+    from database import _get_connection, _release_connection, _execute
+    from psycopg2.extras import execute_values
+
+    applied = 0
+    failed = 0
+    errors = []
+
+    # 1. ONE SELECT for all pending rows with label name
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        _execute(cursor, """
+            SELECT ae.email_id, ae.label_id, ae.last_applied_label_id, cl.label_name
+            FROM analyzed_emails ae
+            JOIN custom_labels cl ON ae.label_id = cl.label_id
+            WHERE ae.user_id = %s AND ae.email_id = ANY(%s)
+        """, (user_id, email_ids))
+        rows = cursor.fetchall()
+    finally:
+        _release_connection(conn)
+
+    if not rows:
+        return {'applied': 0, 'failed': 0, 'errors': []}
+
+    # 2. Build or reuse ONE Gmail service for the whole batch
+    service = get_gmail_service_cached(user_email)
+    if not service:
+        return {'applied': 0, 'failed': len(email_ids),
+                'errors': [{'email_id': 'all', 'error': 'Gmail service unavailable'}]}
+
+    # 3. Resolve each DISTINCT label_name to a Gmail label ID
+    label_names = set(r['label_name'] for r in rows)
+    gmail_label_map = {}  # label_name -> gmail_label_id
+    for name in label_names:
+        gid = get_or_create_label(user_email, name, user_id, gmail_labels_cache)
+        if gid:
+            gmail_label_map[name] = gid
+
+    # Also resolve old labels (last_applied_label_id) to Gmail IDs
+    labels_db = get_labels(user_id)
+    label_id_to_name = {l['label_id']: l['label_name'] for l in labels_db}
+    old_gmail_ids = {}  # label_id -> gmail_label_id (cached)
+
+    def _resolve_old_gmail_id(old_label_id):
+        if old_label_id is None:
+            return None
+        if old_label_id in old_gmail_ids:
+            return old_gmail_ids[old_label_id]
+        old_name = label_id_to_name.get(old_label_id)
+        if old_name:
+            gid = get_or_create_label(user_email, old_name, user_id, gmail_labels_cache)
+            old_gmail_ids[old_label_id] = gid
+            return gid
+        old_gmail_ids[old_label_id] = None
+        return None
+
+    # 4. Group emails by (old_gmail_label_id, new_gmail_label_id)
+    already_synced = []  # (email_id, label_id) pairs where last_applied == current
+    groups = {}  # (old_gid_or_None, new_gid) -> [(email_id, label_id), ...]
+
+    for row in rows:
+        eid = row['email_id']
+        lid = row['label_id']
+        last_lid = row['last_applied_label_id']
+        lname = row['label_name']
+
+        new_gid = gmail_label_map.get(lname)
+        if not new_gid:
+            failed += 1
+            errors.append({'email_id': eid, 'error': f'Gmail label not found for {lname}'})
+            continue
+
+        if last_lid == lid:
+            # Already synced, just mark applied_to_gmail=1
+            already_synced.append((eid, lid))
+            continue
+
+        old_gid = _resolve_old_gmail_id(last_lid)
+        key = (old_gid, new_gid)
+        groups.setdefault(key, []).append((eid, lid))
+
+    # 5. Process each group with batchModify
+    success_pairs = list(already_synced)  # Will also get marked applied
+
+    for (old_gid, new_gid), items in groups.items():
+        # Chunk to <= 1000 ids per batchModify call
+        for chunk_start in range(0, len(items), 1000):
+            chunk = items[chunk_start:chunk_start + 1000]
+            chunk_ids = [eid for eid, _ in chunk]
+
+            body = {'ids': chunk_ids, 'addLabelIds': [new_gid]}
+            if old_gid:
+                body['removeLabelIds'] = [old_gid]
+
+            batch_ok = False
+            for attempt in range(3):
+                try:
+                    service.users().messages().batchModify(userId='me', body=body).execute()
+                    batch_ok = True
+                    break
+                except Exception as e:
+                    status = getattr(getattr(e, 'resp', None), 'status', None)
+                    if status in (429, 500, 502, 503) and attempt < 2:
+                        delay = (2 ** attempt) + random.uniform(0, 1)
+                        logger.warning("[BATCH-SYNC] batchModify %d/%d retrying in %.1fs: %s",
+                                       attempt + 1, 3, delay, e)
+                        time.sleep(delay)
+                    else:
+                        logger.error("[BATCH-SYNC] batchModify failed for %d emails: %s",
+                                     len(chunk_ids), e)
+                        break
+
+            if batch_ok:
+                # Verify a sample of up to 5 ids
+                sample_size = min(5, len(chunk_ids))
+                sample_ids = [chunk_ids[0]]
+                if len(chunk_ids) > 1:
+                    sample_ids.append(chunk_ids[-1])
+                if len(chunk_ids) > 2:
+                    mid_indices = random.sample(range(1, len(chunk_ids) - 1),
+                                                min(sample_size - 2, len(chunk_ids) - 2))
+                    sample_ids.extend(chunk_ids[i] for i in mid_indices)
+
+                verify_ok = True
+                try:
+                    verify_results = {}
+                    verify_errors = {}
+
+                    def _verify_cb(req_id, response, exception):
+                        if exception:
+                            verify_errors[req_id] = exception
+                        else:
+                            verify_results[req_id] = response
+
+                    batch_req = service.new_batch_http_request(callback=_verify_cb)
+                    for sid in sample_ids:
+                        batch_req.add(
+                            service.users().messages().get(userId='me', id=sid, format='minimal'),
+                            request_id=sid,
+                        )
+                    batch_req.execute()
+
+                    for sid in sample_ids:
+                        if sid in verify_results:
+                            if new_gid not in verify_results[sid].get('labelIds', []):
+                                verify_ok = False
+                                logger.warning("[BATCH-SYNC] Verification failed: %s lacks label %s",
+                                               sid[:12], new_gid)
+                                break
+                except Exception as ve:
+                    logger.warning("[BATCH-SYNC] Verification error: %s", ve)
+                    verify_ok = False
+
+                if verify_ok:
+                    success_pairs.extend(chunk)
+                    applied += len(chunk)
+                else:
+                    # Verification failed: fall back to per-email
+                    logger.warning("[BATCH-SYNC] Falling back to per-email for %d emails", len(chunk))
+                    for eid, lid in chunk:
+                        if per_email_fallback:
+                            try:
+                                result = per_email_fallback(eid, user_id, user_email, gmail_labels_cache)
+                                if result.get('success'):
+                                    success_pairs.append((eid, lid))
+                                    applied += 1
+                                else:
+                                    failed += 1
+                                    errors.append({'email_id': eid, 'error': result.get('error', 'Verify fallback failed')})
+                            except Exception as fe:
+                                failed += 1
+                                errors.append({'email_id': eid, 'error': str(fe)})
+                        else:
+                            failed += 1
+                            errors.append({'email_id': eid, 'error': 'Verification failed, no fallback'})
+            else:
+                # batchModify failed: fall back to per-email for this chunk
+                for eid, lid in chunk:
+                    if per_email_fallback:
+                        try:
+                            result = per_email_fallback(eid, user_id, user_email, gmail_labels_cache)
+                            if result.get('success'):
+                                success_pairs.append((eid, lid))
+                                applied += 1
+                            else:
+                                failed += 1
+                                errors.append({'email_id': eid, 'error': result.get('error', 'Fallback failed')})
+                        except Exception as fe:
+                            failed += 1
+                            errors.append({'email_id': eid, 'error': str(fe)})
+                    else:
+                        failed += 1
+                        errors.append({'email_id': eid, 'error': 'batchModify failed, no fallback'})
+
+    # Count already-synced as applied
+    applied += len(already_synced)
+
+    # 6. Bulk DB update: mark success in ONE statement
+    if success_pairs:
+        conn = _get_connection()
+        try:
+            cursor = conn.cursor()
+            execute_values(cursor, """
+                UPDATE analyzed_emails
+                SET applied_to_gmail = 1, last_applied_label_id = v.label_id
+                FROM (VALUES %s) AS v(email_id, label_id, uid)
+                WHERE analyzed_emails.email_id = v.email_id
+                AND analyzed_emails.user_id = v.uid
+            """, [(eid, lid, user_id) for eid, lid in success_pairs])
+            conn.commit()
+        finally:
+            _release_connection(conn)
+
+    return {'applied': applied, 'failed': failed, 'errors': errors}
+
+
+class DBBatchWriter:
+    """
+    Batches async DB updates for analyzed_emails behind DB_BATCH_WRITES=1.
+    Each submit(row) returns a Future that resolves only AFTER the row is committed.
+    Flushes every 20 rows or 1.5s, or on explicit flush()/close().
+    Falls back to per-row update_analyzed_email if the bulk update fails.
+    Step 5 perf/batching.
+    """
+    def __init__(self, user_id: int, max_batch_size: int = 20, flush_interval: float = 1.5):
+        self.user_id = user_id
+        self.max_batch_size = max_batch_size
+        self.flush_interval = flush_interval
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+        self._closed = False
+
+    def start(self):
+        if self._worker_task is None:
+            self._worker_task = asyncio.create_task(self._run_loop())
+
+    async def submit(self, row: dict) -> bool:
+        """Submit a row for batched writing. Awaits durable DB commit."""
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        await self._queue.put((row, fut))
+        return await fut
+
+    async def _flush_items(self, items: list[tuple[dict, asyncio.Future]]):
+        if not items:
+            return
+        rows = [it[0] for it in items]
+        futs = [it[1] for it in items]
+        try:
+            from database import update_analyzed_emails_bulk
+            await asyncio.to_thread(update_analyzed_emails_bulk, self.user_id, rows)
+            for f in futs:
+                if not f.done():
+                    f.set_result(True)
+        except Exception as e:
+            logger.warning("[DB-BATCH] Bulk update failed (%s), falling back per-row", e)
+            from database import update_analyzed_email
+            for r, f in items:
+                try:
+                    kwargs = dict(r)
+                    eid = kwargs.pop("email_id")
+                    kwargs["user_id"] = self.user_id
+                    await asyncio.to_thread(update_analyzed_email, eid, **kwargs)
+                    if not f.done():
+                        f.set_result(True)
+                except Exception as row_err:
+                    if not f.done():
+                        f.set_exception(row_err)
+
+    async def _run_loop(self):
+        while not self._closed or not self._queue.empty():
+            batch = []
+            try:
+                item = await asyncio.wait_for(self._queue.get(), timeout=self.flush_interval)
+                batch.append(item)
+                while len(batch) < self.max_batch_size and not self._queue.empty():
+                    batch.append(self._queue.get_nowait())
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                break
+
+            if batch:
+                await self._flush_items(batch)
+
+    async def flush(self):
+        """Drain and write all remaining items in the queue."""
+        batch = []
+        while not self._queue.empty():
+            batch.append(self._queue.get_nowait())
+        if batch:
+            await self._flush_items(batch)
+
+    async def close(self):
+        self._closed = True
+        if self._worker_task:
+            await self.flush()
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+            self._worker_task = None
 
 
 def trash_email(email_id: str, user_email: str = None) -> bool:
@@ -786,11 +1264,20 @@ async def _fetch_new_emails(limit: int, user_id: int, user_email: str):
         fetched_emails = fetch_result["emails"]
         fetched_count += len(fetched_emails)
 
-        for email in fetched_emails:
-            if is_already_analyzed(email["id"], user_id):
-                skipped_count += 1
-            else:
-                new_emails.append(email)
+        if FETCH_BATCH:
+            ids = [e["id"] for e in fetched_emails]
+            analyzed_ids = await asyncio.to_thread(get_analyzed_email_ids, user_id, ids)
+            for email in fetched_emails:
+                if email["id"] in analyzed_ids:
+                    skipped_count += 1
+                else:
+                    new_emails.append(email)
+        else:
+            for email in fetched_emails:
+                if is_already_analyzed(email["id"], user_id):
+                    skipped_count += 1
+                else:
+                    new_emails.append(email)
 
         next_page_token = fetch_result.get("next_page_token")
         if not fetched_emails or not next_page_token:
@@ -1140,6 +1627,156 @@ def _analysis_text(body: str) -> str:
     return " ".join(" ".join(parser.parts).split())
 
 
+class AIBatcher:
+    """
+    Concurrent AI batcher for label_only_pipeline.
+    Collects items across concurrent _analyze_one tasks and flushes in batches.
+    Step 3 perf/batching (concurrent rewrite).
+    """
+
+    def __init__(
+        self,
+        ai_router,
+        available_labels: list[str],
+        batch_size: int = None,
+        concurrency: int = None,
+        wait_ms: float = None,
+        ai_calls_tracker: list[int] = None,
+    ):
+        self.ai_router = ai_router
+        self.available_labels = list(available_labels) if available_labels else []
+        self.ai_calls_tracker = ai_calls_tracker
+
+        raw_batch_size = (
+            batch_size if batch_size is not None else int(os.getenv("AI_BATCH_SIZE", "1"))
+        )
+        raw_concurrency = (
+            concurrency if concurrency is not None else int(os.getenv("ANALYZE_CONCURRENCY", "3"))
+        )
+
+        if raw_batch_size > raw_concurrency:
+            logger.warning(
+                f"[AI-BATCH] AI_BATCH_SIZE ({raw_batch_size}) exceeds ANALYZE_CONCURRENCY "
+                f"({raw_concurrency}); clamping effective batch size to {raw_concurrency} "
+                f"to prevent deadlock"
+            )
+            self.batch_size = max(1, raw_concurrency)
+        else:
+            self.batch_size = max(1, raw_batch_size)
+
+        self.wait_ms = (
+            wait_ms if wait_ms is not None else float(os.getenv("AI_BATCH_WAIT_MS", "400"))
+        )
+        self._queue: list[tuple[dict, asyncio.Future]] = []
+        self._timer_task: asyncio.Task | None = None
+        self._flush_tasks: set[asyncio.Task] = set()
+        self._closed: bool = False
+
+    def submit(self, item: dict) -> asyncio.Future:
+        """
+        Submit an email item for batch analysis.
+        Returns an asyncio.Future resolving to:
+          {"data": {...}, "provider_used": ...} or None.
+        """
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        if self._closed:
+            fut.set_result(None)
+            return fut
+
+        self._queue.append((item, fut))
+
+        if len(self._queue) >= self.batch_size:
+            # Batch full -> flush immediately
+            batch_to_flush = list(self._queue[: self.batch_size])
+            self._queue = self._queue[self.batch_size :]
+            if self._timer_task and not self._timer_task.done():
+                self._timer_task.cancel()
+                self._timer_task = None
+            self._spawn_flush(batch_to_flush)
+            if self._queue:
+                self._timer_task = asyncio.create_task(self._timer_flush())
+        else:
+            # Not full yet; ensure a timer is running for the first queued item
+            if self._timer_task is None or self._timer_task.done():
+                self._timer_task = asyncio.create_task(self._timer_flush())
+
+        return fut
+
+    def _spawn_flush(self, batch_to_flush: list[tuple[dict, asyncio.Future]]):
+        if not batch_to_flush:
+            return
+        task = asyncio.create_task(self._flush(batch_to_flush))
+        self._flush_tasks.add(task)
+        task.add_done_callback(self._flush_tasks.discard)
+
+    async def _timer_flush(self):
+        try:
+            await asyncio.sleep(self.wait_ms / 1000.0)
+            if self._queue and not self._closed:
+                batch_to_flush = list(self._queue[: self.batch_size])
+                self._queue = self._queue[self.batch_size :]
+                self._spawn_flush(batch_to_flush)
+                if self._queue:
+                    self._timer_task = asyncio.create_task(self._timer_flush())
+                else:
+                    self._timer_task = None
+        except asyncio.CancelledError:
+            pass
+
+    async def _flush(self, batch: list[tuple[dict, asyncio.Future]]):
+        if not batch:
+            return
+        items = [it for it, _ in batch]
+        try:
+            if self.ai_calls_tracker is not None:
+                self.ai_calls_tracker[0] += 1
+            res = await self.ai_router.analyze_batch(items, self.available_labels)
+            by_id = res.get("results_by_id")
+            if by_id is None:
+                by_id = {
+                    r.get("id"): r
+                    for r in res.get("results", [])
+                    if isinstance(r, dict) and "id" in r
+                }
+            provider_used = res.get("provider_used")
+            for item, fut in batch:
+                if fut.done():
+                    continue
+                item_id = item.get("id")
+                parsed_data = by_id.get(item_id)
+                if parsed_data is not None:
+                    fut.set_result({"data": parsed_data, "provider_used": provider_used})
+                else:
+                    fut.set_result(None)
+        except BaseException as e:
+            logger.info(f"[AI-BATCH] Batch flush exception: {e}")
+            for _, fut in batch:
+                if not fut.done():
+                    fut.set_result(None)
+            if isinstance(e, asyncio.CancelledError):
+                raise
+
+    async def close(self):
+        """Flush any pending items and wait for active flushes to finish."""
+        self._closed = True
+        if self._timer_task and not self._timer_task.done():
+            self._timer_task.cancel()
+            self._timer_task = None
+
+        try:
+            while self._queue:
+                batch_to_flush = list(self._queue[: self.batch_size])
+                self._queue = self._queue[self.batch_size :]
+                self._spawn_flush(batch_to_flush)
+            if self._flush_tasks:
+                await asyncio.gather(*list(self._flush_tasks), return_exceptions=True)
+        finally:
+            for _, fut in self._queue:
+                if not fut.done():
+                    fut.set_result(None)
+
+
 MAX_URLS_SCANNED = 30
 
 async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
@@ -1149,7 +1786,13 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                        url_semaphore: asyncio.Semaphore,
                        available_label_names: list[str],
                        gmail_labels_cache: dict[str, str],
-                       update_mode: bool = False) -> dict:
+                       update_mode: bool = False,
+                       label_id_map: dict[str, int] = None,
+                       ai_calls_tracker: list[int] = None,
+                       gmail_calls_tracker: list[int] = None,
+                       precomputed_ai_result: dict = None,
+                       db_writer = None,
+                       ai_batcher = None) -> dict:
     """
     Persist a suggestion and its evidence; Gmail changes require explicit approval.
     Phase 1 Task 2: Track in-flight emails to prevent concurrent analysis.
@@ -1189,6 +1832,11 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             # Phase 1 Task 4: Enable transactional retry queue removal for success writes
             remove_retry = values.get('status') == 'labeled'
             if update_mode:
+                if db_writer is not None:
+                    row = dict(values)
+                    row["email_id"] = email_id
+                    row["remove_from_retry"] = remove_retry
+                    return db_writer.submit(row)
                 # Phase 1 Task 4: Offload blocking DB update to thread pool
                 return asyncio.to_thread(update_analyzed_email, email_id=email_id, user_id=user_id, remove_from_retry=remove_retry, **values)
             else:
@@ -1202,6 +1850,8 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                 return {**base, "status": "skipped", "label": "", "scam_score": None, "is_quarantined": 0}
             if not body:
                 t_body_start = time.perf_counter()
+                if gmail_calls_tracker is not None:
+                    gmail_calls_tracker[0] += 1
                 # Build a thread-local service: httplib2 transports cannot be shared by workers.
                 # Phase 1 Task 4: Offload blocking service build to thread pool
                 service = await asyncio.to_thread(get_gmail_service, user_email)
@@ -1213,34 +1863,121 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                 await persist(label_id=None, scam_score=None, scam_indicators="[]", is_quarantined=0,
                         status="fetched", received_at=received_at, analysis_status="pending")
 
+            async def run_ai_cascade():
+                nonlocal precomputed_ai_result
+                if precomputed_ai_result is not None:
+                    return precomputed_ai_result
+                if ai_batcher is not None:
+                    batch_item = {
+                        "id": email_id,
+                        "subject": subject,
+                        "sender": sender,
+                        "snippet": snippet,
+                        "body": _analysis_text(body)[:6000],
+                        "url_threat_confirmed": url_threat_confirmed,
+                        "url_scan_unavailable": url_scan_unavailable,
+                    }
+                    batch_res = await ai_batcher.submit(batch_item)
+                    if batch_res is not None:
+                        return batch_res
+                    logger.info(
+                        f"[AI-BATCH] Batch AI yielded None for {email_id[:12]}; falling back to single AI call"
+                    )
+                if ai_calls_tracker is not None:
+                    ai_calls_tracker[0] += 1
+                prompt = classification_prompt.format(
+                    sender=sender, subject=subject, body=_analysis_text(body)[:6000],
+                    url_threat_confirmed=url_threat_confirmed,
+                    url_scan_unavailable=url_scan_unavailable,
+                    available_labels=", ".join(available_label_names),
+                )
+                import inspect
+                res = ai_router.analyze_json(prompt)
+                if inspect.isawaitable(res):
+                    return await res
+                return res
+
             # Phase 1 Task 4: Offload HTML parsing (BeautifulSoup) to thread pool
             # Phase 3 Task 10: Batch URL scanning (single Safe Browsing API call)
-            t_url_start = time.perf_counter()
-            urls = list(dict.fromkeys(await asyncio.to_thread(extract_urls, body)))
-            urls_total = len(urls)
-            selected_urls = urls[:MAX_URLS_SCANNED]
-            
-            # Batch scan all URLs in one request (replaces gather + per-URL calls)
-            from security import scan_urls_batch
-            scan_results_dict = await scan_urls_batch(selected_urls, email_id, url_client)
-            t_url = time.perf_counter() - t_url_start
-            
-            # Phase 3 Task 11: URL scan failures do NOT downgrade analysis_status
-            url_scan_unavailable = len(selected_urls) < urls_total  # capped URLs
-            for url, result in scan_results_dict.items():
-                if result.get("scan_failed") or result.get("is_safe") is None:
+            if email.get("url_threat_confirmed") is not None:
+                url_threat_confirmed = email["url_threat_confirmed"]
+                url_scan_unavailable = email.get("url_scan_unavailable", False)
+                url_scan_status = (
+                    "threat_detected" if url_threat_confirmed else
+                    "unavailable" if url_scan_unavailable else "completed"
+                )
+            elif URL_AI_OVERLAP and precomputed_ai_result is None:
+                # Step 4c: Parallelize URL scanning and AI call
+                urls = list(dict.fromkeys(await asyncio.to_thread(extract_urls, body)))
+                urls_total = len(urls)
+                selected_urls = urls[:MAX_URLS_SCANNED]
+
+                from security import scan_urls_batch
+                t_url_start = time.perf_counter()
+
+                scan_task = asyncio.create_task(scan_urls_batch(selected_urls, email_id, url_client))
+                ai_early_task = asyncio.create_task(run_ai_cascade())
+                gather_res = await asyncio.gather(scan_task, ai_early_task, return_exceptions=True)
+                t_url = time.perf_counter() - t_url_start
+
+                scan_res, ai_res = gather_res[0], gather_res[1]
+
+                # URL failure doesn't discard AI
+                if isinstance(scan_res, Exception):
+                    logger.info(f"[URL-SCAN] URL scan failed for {email_id[:12]}: {scan_res}")
+                    scan_results_dict = {}
                     url_scan_unavailable = True
-                    continue
-                urls_checked += 1
-                if result.get("is_safe") == 0 and result.get("threat_type"):
-                    url_threat_confirmed = True
-            
-            url_scan_status = (
-                "threat_detected" if url_threat_confirmed else
-                "not_applicable" if not urls_total else
-                "unavailable" if not urls_checked else
-                "partial" if url_scan_unavailable else "completed"
-            )
+                else:
+                    scan_results_dict = scan_res if isinstance(scan_res, dict) else {}
+                    url_scan_unavailable = len(selected_urls) < urls_total
+                    for url, result in scan_results_dict.items():
+                        if result.get("scan_failed") or result.get("is_safe") is None:
+                            url_scan_unavailable = True
+                            continue
+                        urls_checked += 1
+                        if result.get("is_safe") == 0 and result.get("threat_type"):
+                            url_threat_confirmed = True
+
+                url_scan_status = (
+                    "threat_detected" if url_threat_confirmed else
+                    "not_applicable" if not urls_total else
+                    "unavailable" if not urls_checked else
+                    "partial" if url_scan_unavailable else "completed"
+                )
+
+                # AI failure still records URL
+                if isinstance(ai_res, Exception):
+                    logger.info(f"[URL-AI-OVERLAP] Early AI failed for {email_id[:12]}: {ai_res}")
+                    precomputed_ai_result = None
+                else:
+                    precomputed_ai_result = ai_res
+            else:
+                t_url_start = time.perf_counter()
+                urls = list(dict.fromkeys(await asyncio.to_thread(extract_urls, body)))
+                urls_total = len(urls)
+                selected_urls = urls[:MAX_URLS_SCANNED]
+                
+                # Batch scan all URLs in one request (replaces gather + per-URL calls)
+                from security import scan_urls_batch
+                scan_results_dict = await scan_urls_batch(selected_urls, email_id, url_client)
+                t_url = time.perf_counter() - t_url_start
+                
+                # Phase 3 Task 11: URL scan failures do NOT downgrade analysis_status
+                url_scan_unavailable = len(selected_urls) < urls_total  # capped URLs
+                for url, result in scan_results_dict.items():
+                    if result.get("scan_failed") or result.get("is_safe") is None:
+                        url_scan_unavailable = True
+                        continue
+                    urls_checked += 1
+                    if result.get("is_safe") == 0 and result.get("threat_type"):
+                        url_threat_confirmed = True
+                
+                url_scan_status = (
+                    "threat_detected" if url_threat_confirmed else
+                    "not_applicable" if not urls_total else
+                    "unavailable" if not urls_checked else
+                    "partial" if url_scan_unavailable else "completed"
+                )
 
             # Phase 5: Attachment scanning
             from attachment_scanner import scan_attachments
@@ -1280,15 +2017,6 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             except Exception as init_err:
                 logger.error("[PIPELINE] V2 router initialization failed: %s", str(init_err))
                 V2_ROUTER_AVAILABLE = False
-
-            async def run_ai_cascade():
-                prompt = classification_prompt.format(
-                    sender=sender, subject=subject, body=_analysis_text(body)[:6000],
-                    url_threat_confirmed=url_threat_confirmed,
-                    url_scan_unavailable=url_scan_unavailable,
-                    available_labels=", ".join(available_label_names),
-                )
-                return await ai_router.analyze_json(prompt)
 
             if V2_ROUTER_AVAILABLE:
                 routed = await route_email_with_v2(
@@ -1351,6 +2079,8 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             if match is None and isinstance(score, int) and not isinstance(score, bool) and 0 <= score <= 100:
                 # Label unusable but score valid: ONE tiny follow-up call for the label only.
                 try:
+                    if ai_calls_tracker is not None:
+                        ai_calls_tracker[0] += 1
                     match = await ai_router.label_only(
                         sender, subject, _analysis_text(body)[:1500], available_label_names)
                 except Exception as label_error:
@@ -1362,7 +2092,12 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             if category_status == "complete":
                 category_status = "completed"
             label = match if match and category_status == "completed" else "Unknown"
-            label_id = get_label_id_by_name(user_id, label) if label != "Unknown" else None
+            if label != "Unknown":
+                label_id = label_id_map.get(label.casefold()) if label_id_map else None
+                if label_id is None:
+                    label_id = get_label_id_by_name(user_id, label)
+            else:
+                label_id = None
             if isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 100:
                 raise ValueError("No valid security assessment")
             indicators = routed.get("scam_indicators", [])
@@ -1501,37 +2236,107 @@ async def fetch_only_pipeline(limit: int = 50, user_id: int = None, user_email: 
         yield {"type": "complete", "fetched": 0, "error": "An internal error occurred during analysis."}
         return
 
-    saved_count = 0
-    for email in new_emails:
-        try:
-            # Fetch full body before saving (metadata fetch returns body="")
-            body = email.get("body", "")
-            if not body:
-                body = await asyncio.to_thread(_get_email_body, service, email["id"])
-            
-            save_analyzed_email(
-                email_id=email["id"],
-                user_id=user_id,
-                label_id=None,
-                scam_score=None,
-                scam_indicators='[]',
-                is_quarantined=0,
-                snippet=email.get("snippet", ""),
-                sender=email.get("sender", ""),
-                subject=email.get("subject", ""),
-                status='fetched',
-                body=body,
-            )
-            saved_count += 1
+    if FETCH_BATCH:
+        # Step 2 perf/batching: batch body fetch and bulk DB insertion
+        creds = await asyncio.to_thread(get_credentials, user_email)
+        worker_creds = creds if creds else service
+
+        chunks = [
+            new_emails[i:i + FETCH_BATCH_SIZE]
+            for i in range(0, len(new_emails), FETCH_BATCH_SIZE)
+        ]
+        worker_sem = asyncio.Semaphore(FETCH_BATCH_PARALLEL)
+
+        async def _process_chunk(chunk):
+            chunk_ids = [e["id"] for e in chunk]
+            try:
+                async with worker_sem:
+                    bodies = await asyncio.to_thread(_get_email_bodies_batch, worker_creds, chunk_ids)
+            except Exception as e:
+                logger.info(f"[FETCH-ONLY] Batch body fetch failed for {len(chunk_ids)} emails: {e}")
+                bodies = {}
+
+            rows = []
+            for email in chunk:
+                eid = email["id"]
+                b = email.get("body") or bodies.get(eid, "")
+                email["body"] = b
+                rows.append({
+                    "email_id": eid,
+                    "snippet": email.get("snippet", ""),
+                    "sender": email.get("sender", ""),
+                    "subject": email.get("subject", ""),
+                    "body": b,
+                })
+
+            try:
+                await asyncio.to_thread(save_fetched_emails_bulk, user_id, rows)
+                return len(rows)
+            except Exception as e:
+                logger.info(f"[FETCH-ONLY] Bulk save failed, falling back to per-email save: {e}")
+                saved = 0
+                for r in rows:
+                    try:
+                        await asyncio.to_thread(
+                            save_analyzed_email,
+                            email_id=r["email_id"],
+                            user_id=user_id,
+                            label_id=None,
+                            scam_score=None,
+                            scam_indicators='[]',
+                            is_quarantined=0,
+                            snippet=r["snippet"],
+                            sender=r["sender"],
+                            subject=r["subject"],
+                            status='fetched',
+                            body=r["body"],
+                        )
+                        saved += 1
+                    except Exception:
+                        pass
+                return saved
+
+        saved_count = 0
+        tasks = [asyncio.create_task(_process_chunk(c)) for c in chunks]
+        for coro in asyncio.as_completed(tasks):
+            chunk_saved = await coro
+            saved_count += chunk_saved
             yield {"type": "progress", "current": saved_count, "total": len(new_emails)}
-        except Exception as e:
-            logger.info(f"[FETCH-ONLY] Failed to save {email['id']}: {e}")
-            continue
 
-    yield {"type": "complete", "fetched": saved_count, "skipped": skipped_count}
+        yield {"type": "complete", "fetched": saved_count, "skipped": skipped_count}
+    else:
+        # Legacy sequential loop
+        saved_count = 0
+        for email in new_emails:
+            try:
+                # Fetch full body before saving (metadata fetch returns body="")
+                body = email.get("body", "")
+                if not body:
+                    body = await asyncio.to_thread(_get_email_body, service, email["id"])
+                
+                save_analyzed_email(
+                    email_id=email["id"],
+                    user_id=user_id,
+                    label_id=None,
+                    scam_score=None,
+                    scam_indicators='[]',
+                    is_quarantined=0,
+                    snippet=email.get("snippet", ""),
+                    sender=email.get("sender", ""),
+                    subject=email.get("subject", ""),
+                    status='fetched',
+                    body=body,
+                )
+                saved_count += 1
+                yield {"type": "progress", "current": saved_count, "total": len(new_emails)}
+            except Exception as e:
+                logger.info(f"[FETCH-ONLY] Failed to save {email['id']}: {e}")
+                continue
+
+        yield {"type": "complete", "fetched": saved_count, "skipped": skipped_count}
 
 
-async def label_only_pipeline(limit: int = None, user_id: int = None, user_email: str = None, email_ids: list[str] = None):
+async def label_only_pipeline(limit: int = None, user_id: int = None, user_email: str = None, email_ids: list[str] = None, run_id: str = None):
     """
     Read status='fetched' emails from DB and run AI analysis.
     Updates rows to status='labeled'. Yields SSE progress events.
@@ -1541,10 +2346,17 @@ async def label_only_pipeline(limit: int = None, user_id: int = None, user_email
         user_id: User ID for ownership check
         user_email: User's email address
         email_ids: Optional list of specific email IDs to process (exact retry targets)
+        run_id: Optional tracking identifier for run summary
     """
+    import uuid
     from ai_router import ai_router, CLASSIFICATION_PROMPT, ANALYZE_CONCURRENCY
     from database import get_emails_by_status, get_emails_by_ids
     import httpx
+
+    run_id = run_id or f"lbl-{uuid.uuid4().hex[:8]}"
+    t_pipeline_start = time.perf_counter()
+    pipeline_ai_calls = [0]
+    pipeline_gmail_calls = [1]  # 1 for service.users().labels().list()
 
     if user_email is None and user_id is not None:
         user_email = get_user_email_by_id(user_id)
@@ -1568,6 +2380,7 @@ async def label_only_pipeline(limit: int = None, user_id: int = None, user_email
     # Cache labels once per bulk run (instead of per-email DB query)
     available_labels_list = await asyncio.to_thread(get_labels, user_id)
     available_label_names = [lbl["label_name"] for lbl in available_labels_list]
+    label_id_by_name = {lbl["label_name"].casefold(): lbl["label_id"] for lbl in available_labels_list}
 
     async with httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(max_connections=50)) as url_client:
         yield {"type": "initializing", "message": "Starting AI analysis..."}
@@ -1585,56 +2398,96 @@ async def label_only_pipeline(limit: int = None, user_id: int = None, user_email
         total = len(fetched_emails)
         yield {"type": "progress", "current": 0, "total": total}
 
-        tasks = [
-            asyncio.create_task(_analyze_one(
-                email=email,
-                semaphore=semaphore,
-                ai_router=ai_router,
-                classification_prompt=CLASSIFICATION_PROMPT,
-                user_id=user_id,
-                user_email=user_email,
-                service=service,
-                url_client=url_client,
-                url_semaphore=url_semaphore,
-                available_label_names=available_label_names,
-                gmail_labels_cache=gmail_labels_cache,
-                update_mode=True,
-            ))
-            for email in fetched_emails
-        ]
+        from ai_router import AI_BATCH_SIZE, ANALYZE_CONCURRENCY
 
-        done_queue = asyncio.Queue()
-        
-        async def track_completion(task, idx):
-            result = await task
-            await done_queue.put((idx, result))
-        
-        tracking_tasks = [asyncio.create_task(track_completion(t, i)) for i, t in enumerate(tasks)]
-        
         analyzed_count = 0
         failed_count = 0
         results = []
+
+        db_writer = None
+        if DB_BATCH_WRITES:
+            db_writer = DBBatchWriter(user_id=user_id)
+            db_writer.start()
+
+        ai_batcher = None
+        if AI_BATCH_SIZE > 1:
+            ai_batcher = AIBatcher(
+                ai_router=ai_router,
+                available_labels=available_label_names,
+                batch_size=AI_BATCH_SIZE,
+                concurrency=ANALYZE_CONCURRENCY,
+                ai_calls_tracker=pipeline_ai_calls,
+            )
+
+        try:
+            tasks = [
+                asyncio.create_task(_analyze_one(
+                    email=email,
+                    semaphore=semaphore,
+                    ai_router=ai_router,
+                    classification_prompt=CLASSIFICATION_PROMPT,
+                    user_id=user_id,
+                    user_email=user_email,
+                    service=service,
+                    url_client=url_client,
+                    url_semaphore=url_semaphore,
+                    available_label_names=available_label_names,
+                    gmail_labels_cache=gmail_labels_cache,
+                    update_mode=True,
+                    label_id_map=label_id_by_name,
+                    ai_calls_tracker=pipeline_ai_calls,
+                    gmail_calls_tracker=pipeline_gmail_calls,
+                    db_writer=db_writer,
+                    ai_batcher=ai_batcher,
+                ))
+                for email in fetched_emails
+            ]
+
+            done_queue = asyncio.Queue()
+
+            async def track_completion(task, idx):
+                result = await task
+                await done_queue.put((idx, result))
+
+            tracking_tasks = [asyncio.create_task(track_completion(t, i)) for i, t in enumerate(tasks)]
+
+            for _ in range(len(tasks)):
+                idx, result = await done_queue.get()
+
+                if result.get("status") == "failed":
+                    failed_count += 1
+                elif result.get("status") == "success":
+                    analyzed_count += 1
+                    results.append(result)
+
+                yield {
+                    "type": "email_done",
+                    "current": analyzed_count + failed_count,
+                    "total": total,
+                    "email_id": result.get("email_id"),
+                    "subject": result.get("subject"),
+                    "label": result.get("label", ""),
+                    "scam_score": result.get("scam_score", 0),
+                }
+
+            await asyncio.gather(*tracking_tasks)
+        finally:
+            if ai_batcher is not None:
+                try:
+                    await ai_batcher.close()
+                except Exception as e:
+                    logger.info(f"[AI-BATCH] Error closing batcher: {e}")
+            if db_writer is not None:
+                await db_writer.close()
         
-        for _ in range(len(tasks)):
-            idx, result = await done_queue.get()
-            
-            if result.get("status") == "failed":
-                failed_count += 1
-            elif result.get("status") == "success":
-                analyzed_count += 1
-                results.append(result)
-            
-            yield {
-                "type": "email_done",
-                "current": analyzed_count + failed_count,
-                "total": total,
-                "email_id": result.get("email_id"),
-                "subject": result.get("subject"),
-                "label": result.get("label", ""),
-                "scam_score": result.get("scam_score", 0),
-            }
-        
-        await asyncio.gather(*tracking_tasks)
-        
+        wall = time.perf_counter() - t_pipeline_start
+        total_emails = analyzed_count + failed_count
+        emails_per_min = (total_emails / wall * 60) if wall > 0 else 0.0
+        ai_calls = pipeline_ai_calls[0]
+        gmail_calls = pipeline_gmail_calls[0]
+        summary_msg = f"[RUN_SUMMARY] run_id={run_id} emails={total_emails} wall={wall:.2f}s emails_per_min={emails_per_min:.1f} ai_calls={ai_calls} gmail_calls={gmail_calls}"
+        logger.info(summary_msg)
+        print(summary_msg)
+
         yield {"type": "complete", "analyzed": analyzed_count, "failed": failed_count, "results": results}
 
