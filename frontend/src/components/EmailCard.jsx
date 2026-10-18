@@ -80,6 +80,7 @@ function EmailCard({
   function formatDate(dateStr) {
     if (!dateStr) return 'Unknown';
     const date = new Date(dateStr);
+    if (isNaN(date.getTime())) return 'Unknown';
     const now = new Date();
     const diffMs = now - date;
     const diffMins = Math.floor(diffMs / 60000);
@@ -87,7 +88,7 @@ function EmailCard({
     const diffDays = Math.floor(diffMs / 86400000);
 
     // Show exact relative time
-    if (diffMins === 0) return 'Just now';
+    if (diffMs < 0 || diffMins === 0) return 'Just now';
     if (diffMins === 1) return '1 minute ago';
     if (diffMins < 60) return `${diffMins} minutes ago`;
     if (diffHours === 1) return '1 hour ago';
