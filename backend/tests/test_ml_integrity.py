@@ -151,3 +151,69 @@ def test_load_model_no_active_model(monkeypatch):
     
     # Verify returns None for AI-only mode
     assert result is None
+
+
+def test_predict_load_model_concurrency_with_slow_loader(monkeypatch):
+    """
+    Task 3: Verify load_model uses a lock so that 8 threads calling load_model concurrently
+    with a fake slow loader only run the loader exactly once.
+    """
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    import predict
+
+    # Reset cache
+    monkeypatch.setattr(predict, "_model", None)
+    
+    class DummyPath:
+        def exists(self):
+            return True
+        def __str__(self):
+            return "dummy_scam_classifier.pkl"
+    monkeypatch.setattr(predict, "_model_path", DummyPath())
+
+    load_count = 0
+    load_lock = threading.Lock()
+
+    def fake_slow_loader(path):
+        nonlocal load_count
+        with load_lock:
+            load_count += 1
+        time.sleep(0.05)
+        return {"fake": "model"}
+
+    monkeypatch.setattr(predict.joblib, "load", fake_slow_loader)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(predict.load_model) for _ in range(8)]
+        results = [f.result() for f in futures]
+
+    assert load_count == 1
+    assert all(r == {"fake": "model"} for r in results)
+
+
+@pytest.mark.asyncio
+async def test_startup_with_missing_model_file_does_not_crash(monkeypatch):
+    """
+    Task 3: Verify that application startup (lifespan) completes without error
+    even if the model file is missing or corrupt.
+    """
+    import asyncio
+    import predict
+    from main import app, lifespan
+
+    def mock_missing_model():
+        raise FileNotFoundError("Model file not found: scam_classifier_v2.pkl")
+
+    monkeypatch.setattr(predict, "load_model", mock_missing_model)
+    monkeypatch.setenv("ML_PRELOAD", "1")
+    monkeypatch.setattr("main.init_db", lambda: None)
+    monkeypatch.setattr("main.load_active_model", lambda: None)
+    monkeypatch.setattr("main.migrate_legacy_tokens", lambda: None)
+
+    # Lifespan should complete startup cleanly
+    async with lifespan(app):
+        pass
+    # Allow background event loop turn for preload task to run and handle exception
+    await asyncio.sleep(0.05)

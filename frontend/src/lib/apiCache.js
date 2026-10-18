@@ -124,6 +124,7 @@ export const apiCache = new APICache(100, 60000); // 100 items, 60s TTL
 // Cache configuration for specific endpoints
 export const CACHE_CONFIG = {
   '/emails': { ttl: 30000 },           // 30s - emails change frequently
+  '/emails/body': { ttl: 300000 },     // 5min - individual email bodies are static
   '/labels': { ttl: 300000 },          // 5min - labels rarely change
   '/settings': { ttl: 300000 },        // 5min - settings rarely change
   '/emails/stats': { ttl: 60000 },     // 1min - stats update moderately

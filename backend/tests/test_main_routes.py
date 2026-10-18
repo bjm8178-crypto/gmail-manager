@@ -272,3 +272,153 @@ def test_cors_headers_present():
     
     # CORS preflight should return headers
     assert response.status_code in [200, 204, 405]
+
+
+def test_emails_get_omits_body_by_default():
+    """Test GET /emails passes include_body=False when EMAILS_LIST_INCLUDE_BODY is 0"""
+    from main import app
+    from dependencies import require_auth
+    import os
+
+    app.dependency_overrides[require_auth] = lambda: {"user_id": 1, "email": "test@example.com"}
+    client = TestClient(app)
+
+    try:
+        with patch.dict(os.environ, {"EMAILS_LIST_INCLUDE_BODY": "0"}), \
+             patch('main.get_analyzed_emails', return_value=[{"email_id": "e1", "snippet": "snip"}]) as mock_get:
+            response = client.get("/emails")
+            assert response.status_code == 200
+            data = response.json()
+            assert len(data["emails"]) == 1
+            assert "body" not in data["emails"][0]
+            mock_get.assert_called_once_with(1, include_body=False)
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_emails_get_includes_body_when_flag_enabled():
+    """Test GET /emails passes include_body=True when EMAILS_LIST_INCLUDE_BODY is 1"""
+    from main import app
+    from dependencies import require_auth
+    import os
+
+    app.dependency_overrides[require_auth] = lambda: {"user_id": 1, "email": "test@example.com"}
+    client = TestClient(app)
+
+    try:
+        with patch.dict(os.environ, {"EMAILS_LIST_INCLUDE_BODY": "1"}), \
+             patch('main.get_analyzed_emails', return_value=[{"email_id": "e1", "snippet": "snip", "body": "full"}]) as mock_get:
+            response = client.get("/emails")
+            assert response.status_code == 200
+            data = response.json()
+            assert len(data["emails"]) == 1
+            assert data["emails"][0]["body"] == "full"
+            mock_get.assert_called_once_with(1, include_body=True)
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_email_get_body_endpoint_owner_success():
+    """Test GET /emails/{email_id}/body returns body and snippet with private, no-store Cache-Control"""
+    from main import app
+    from dependencies import require_auth
+
+    app.dependency_overrides[require_auth] = lambda: {"user_id": 1, "email": "test@example.com"}
+    client = TestClient(app)
+
+    try:
+        with patch('main.get_email_body', return_value={"email_id": "e123", "body": "Important text", "snippet": "Important..."}):
+            response = client.get("/emails/e123/body")
+            assert response.status_code == 200
+            assert response.headers.get("Cache-Control") == "private, no-store"
+            data = response.json()
+            assert data["email_id"] == "e123"
+            assert data["body"] == "Important text"
+            assert data["snippet"] == "Important..."
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_email_get_body_endpoint_not_found_or_other_user():
+    """Test GET /emails/{email_id}/body returns 404 when email not found or not owned by user"""
+    from main import app
+    from dependencies import require_auth
+
+    app.dependency_overrides[require_auth] = lambda: {"user_id": 1, "email": "test@example.com"}
+    client = TestClient(app)
+
+    try:
+        with patch('main.get_email_body', return_value=None):
+            response = client.get("/emails/other-user-email/body")
+            assert response.status_code == 404
+            assert response.headers.get("Cache-Control") == "private, no-store"
+            data = response.json()
+            assert "Email not found" in data["error"]
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_auth_status_does_not_block_event_loop_during_token_refresh():
+    """
+    Test that auth_status offloads sync token loading and refresh to a worker thread
+    via asyncio.to_thread, ensuring concurrent event loop tasks (e.g. 50ms ticker)
+    are not blocked when refresh() takes 0.5s.
+    """
+    import asyncio
+    import json
+    import time
+    from unittest.mock import patch, MagicMock
+    from starlette.requests import Request
+    from main import auth_status
+
+    tick_intervals = []
+    stop_ticker = False
+
+    async def ticker():
+        last = time.perf_counter()
+        while not stop_ticker:
+            await asyncio.sleep(0.05)
+            now = time.perf_counter()
+            tick_intervals.append(now - last)
+            last = now
+
+    def fake_refresh(request):
+        time.sleep(0.5)
+
+    fake_creds = MagicMock()
+    fake_creds.expired = True
+    fake_creds.refresh_token = "refresh_token_123"
+    fake_creds.valid = True
+    fake_creds.refresh.side_effect = fake_refresh
+    fake_creds.to_json.return_value = json.dumps({"token": "new_token"})
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/auth/status",
+        "headers": [],
+        "session": {},
+        "cookies": {},
+    }
+    req = Request(scope)
+
+    ticker_task = asyncio.create_task(ticker())
+    await asyncio.sleep(0.01)  # Yield to event loop so ticker starts before auth_status
+
+    with patch("main.get_user_from_token", return_value={"user_id": 1, "email": "test@example.com"}), \
+         patch("auth.get_user_token", return_value=json.dumps({"token": "old_token"})), \
+         patch("auth.Credentials.from_authorized_user_info", return_value=fake_creds), \
+         patch("auth.save_user_token", return_value=None):
+        resp = await auth_status(req)
+
+    stop_ticker = True
+    await ticker_task
+
+    max_gap = max(tick_intervals) if tick_intervals else 0.0
+    assert max_gap < 0.2, f"Event loop was blocked! Max ticker gap was {max_gap:.3f}s (must be < 0.2s)"
+    data = json.loads(resp.body) if hasattr(resp, "body") else resp
+    assert data["logged_in"] is True
+    assert fake_creds.refresh.called
+
+

@@ -32,6 +32,46 @@ function EmailDetailModal({ email, senderName, senderEmail, decodedSubject, indi
   const fileInputRef = useRef(null);
   const toast = useToast();
 
+  const [fetchedBody, setFetchedBody] = useState(email?.body || null);
+  const [loadingBody, setLoadingBody] = useState(!email?.body && Boolean(email?.email_id || email?.id));
+
+  useEffect(() => {
+    if (email?.body) {
+      setFetchedBody(email.body);
+      setLoadingBody(false);
+      return;
+    }
+    const emailId = email?.email_id || email?.id;
+    if (!emailId) return;
+
+    let isMounted = true;
+    setLoadingBody(true);
+
+    const loadBody = async () => {
+      try {
+        const res = await apiRequest(`/emails/${encodeURIComponent(emailId)}/body`);
+        if (res.ok) {
+          const data = await res.json();
+          if (isMounted && data?.body) {
+            setFetchedBody(data.body);
+          }
+        }
+      } catch (err) {
+        console.warn('Failed to load email body, falling back to snippet:', err);
+      } finally {
+        if (isMounted) {
+          setLoadingBody(false);
+        }
+      }
+    };
+
+    loadBody();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [email?.email_id, email?.id, email?.body]);
+
   const dialogRef = useModalFocus(onClose);
 
   const handleFileSelect = (e) => {
@@ -294,9 +334,15 @@ function EmailDetailModal({ email, senderName, senderEmail, decodedSubject, indi
               paddingTop: '1rem',
             }}
           >
+            {loadingBody && (
+              <div className="flex items-center gap-2 mb-2 text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                <div className="w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin" />
+                <span>Loading full email body...</span>
+              </div>
+            )}
             <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
               <EmailBodyFrame
-                body={email.body || email.snippet}
+                body={fetchedBody || email.body || email.snippet}
                 className="text-sm"
                 textStyle={{ color: 'var(--color-text-primary)', lineHeight: '1.7' }}
               />

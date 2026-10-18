@@ -17,15 +17,14 @@ class TestBatchFetch:
     @pytest.mark.asyncio
     @patch('gmail.get_analyzed_email_ids')
     @patch('gmail.is_already_analyzed')
-    @patch('gmail.fetch_emails')
+    @patch('gmail._fetch_email_details')
+    @patch('gmail.list_message_ids')
     async def test_fetch_new_emails_filters_in_single_db_query(
-        self, mock_fetch, mock_is_analyzed, mock_get_analyzed_ids
+        self, mock_list, mock_fetch_details, mock_is_analyzed, mock_get_analyzed_ids
     ):
         """When FETCH_BATCH=1, _fetch_new_emails calls get_analyzed_email_ids once, not is_already_analyzed N times."""
-        mock_fetch.return_value = {
-            'emails': [{'id': f'e_{i}', 'snippet': f'snip_{i}'} for i in range(50)],
-            'next_page_token': None,
-        }
+        mock_list.return_value = ([f'e_{i}' for i in range(50)], None)
+        mock_fetch_details.side_effect = lambda ids, **kw: [{'id': mid, 'snippet': f'snip_{mid}'} for mid in ids]
         # Simulate that e_0 and e_1 are already analyzed
         mock_get_analyzed_ids.return_value = {'e_0', 'e_1'}
 
@@ -33,25 +32,26 @@ class TestBatchFetch:
         with patch('gmail.FETCH_BATCH', 1):
             new_emails, skipped, fetched = await _fetch_new_emails(limit=50, user_id=1, user_email='test@test.com')
 
-        assert fetched == 50
+        assert fetched == 48
         assert skipped == 2
         assert len(new_emails) == 48
         # Called once in batch, never called sequentially
         mock_get_analyzed_ids.assert_called_once()
         mock_is_analyzed.assert_not_called()
+        mock_fetch_details.assert_called_once()
+        assert len(mock_fetch_details.call_args[0][0]) == 48
 
     @pytest.mark.asyncio
     @patch('gmail.get_analyzed_email_ids')
     @patch('gmail.is_already_analyzed')
-    @patch('gmail.fetch_emails')
+    @patch('gmail._fetch_email_details')
+    @patch('gmail.list_message_ids')
     async def test_fetch_new_emails_legacy_when_flag_off(
-        self, mock_fetch, mock_is_analyzed, mock_get_analyzed_ids
+        self, mock_list, mock_fetch_details, mock_is_analyzed, mock_get_analyzed_ids
     ):
         """When FETCH_BATCH=0, _fetch_new_emails uses the sequential is_already_analyzed loop."""
-        mock_fetch.return_value = {
-            'emails': [{'id': f'e_{i}', 'snippet': f'snip_{i}'} for i in range(10)],
-            'next_page_token': None,
-        }
+        mock_list.return_value = ([f'e_{i}' for i in range(10)], None)
+        mock_fetch_details.side_effect = lambda ids, **kw: [{'id': mid, 'snippet': f'snip_{mid}'} for mid in ids]
         mock_is_analyzed.return_value = False
 
         from gmail import _fetch_new_emails
@@ -62,6 +62,7 @@ class TestBatchFetch:
         assert len(new_emails) == 10
         assert mock_is_analyzed.call_count == 10
         mock_get_analyzed_ids.assert_not_called()
+        mock_fetch_details.assert_called_once()
 
     @pytest.mark.asyncio
     @patch('gmail.get_credentials')

@@ -127,13 +127,16 @@ async def scan_urls_batch(urls: list[str], email_id: str,
     # Step 1: Check cache for ALL URLs first
     results = {}
     uncached_urls = []
+    mem_hits = 0
+    db_hits = 0
     
     for url in unique_urls:
         # Check in-memory cache first (fast path)
         async with _cache_lock:
             cached_result = URL_SAFETY_CACHE.get(url)
             if cached_result is not None:
-                logger.info(f"[SECURITY] In-memory cache hit: {url[:60]}")
+                mem_hits += 1
+                logger.debug(f"[SECURITY] In-memory cache hit: {url[:60]}")
                 results[url] = {
                     "url": url,
                     "is_safe": cached_result[0],
@@ -145,7 +148,8 @@ async def scan_urls_batch(urls: list[str], email_id: str,
         # Check persistent cache (offload to thread)
         cached = await asyncio.to_thread(get_cached_url, url)
         if cached is not None:
-            logger.info(f"[SECURITY] DB cache hit: {url[:60]}")
+            db_hits += 1
+            logger.debug(f"[SECURITY] DB cache hit: {url[:60]}")
             results[url] = {
                 "url": url,
                 "is_safe": cached["is_safe"],
@@ -158,6 +162,9 @@ async def scan_urls_batch(urls: list[str], email_id: str,
         else:
             uncached_urls.append(url)
     
+    if unique_urls:
+        logger.info(f"[SECURITY] URL cache: {len(unique_urls)} total, {mem_hits} memory hits, {db_hits} db hits, {len(uncached_urls)} to scan")
+
     if not uncached_urls:
         logger.info(f"[SECURITY] All {len(unique_urls)} URLs cached, no API call needed")
         return results
@@ -326,7 +333,7 @@ async def scan_url(url: str, email_id: str,
     # Step 1: Check cache first (offload blocking DB call to thread)
     cached = await asyncio.to_thread(get_cached_url, url)
     if cached is not None:
-        logger.info(f"[SECURITY] Cache hit for URL: {url[:60]}")
+        logger.debug(f"[SECURITY] Cache hit for URL: {url[:60]}")
         return {
             "url": url,
             "is_safe": cached["is_safe"],
@@ -338,7 +345,7 @@ async def scan_url(url: str, email_id: str,
     async with _cache_lock:
         cached_result = URL_SAFETY_CACHE.get(url)
         if cached_result is not None:
-            logger.info(f"[SECURITY] In-memory cache hit for URL: {url[:60]}")
+            logger.debug(f"[SECURITY] In-memory cache hit for URL: {url[:60]}")
             return {"url": url, "is_safe": cached_result[0], "threat_type": cached_result[1]}
 
     # Step 3: No cache — call Google Safe Browsing API v4

@@ -12,21 +12,34 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from typing import Dict
+import threading
+import time
+from logger_setup import get_logger
+
+logger = get_logger(__name__)
 
 # Global model cache
 _model = None
 _model_path = Path(__file__).parent / 'scam_classifier_v2.pkl'
+_model_lock = threading.Lock()
 
 def load_model():
     """Load the trained model (cached after first load)."""
     global _model
-    if _model is None:
+    if _model is not None:
+        return _model
+    with _model_lock:
+        if _model is not None:
+            return _model
         if not _model_path.exists():
             raise FileNotFoundError(
                 f"Model file not found: {_model_path}\n"
                 "Please run train_model.py first to generate scam_classifier.pkl"
             )
+        t0 = time.perf_counter()
         _model = joblib.load(_model_path)
+        elapsed = time.perf_counter() - t0
+        logger.info(f"[ML] model loaded in {elapsed:.2f} s")
     return _model
 
 

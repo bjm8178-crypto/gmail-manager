@@ -185,7 +185,8 @@ function Inbox() {
           const q = search.toLowerCase();
           filtered = filtered.filter(e =>
             (e.sender || '').toLowerCase().includes(q) ||
-            (e.subject || '').toLowerCase().includes(q)
+            (e.subject || '').toLowerCase().includes(q) ||
+            (e.snippet || '').toLowerCase().includes(q)
           );
         }
 

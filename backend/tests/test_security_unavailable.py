@@ -138,6 +138,44 @@ class SafeBrowsingUnavailableTests(unittest.IsolatedAsyncioTestCase):
             "Rate limit must return is_safe=None, not safe or threat")
         self.assertTrue(result.get('scan_failed', False))
 
+    async def test_check_urls_safety_logs_summary_and_debug_hits(self):
+        """Task 5: Verify cache hits log at DEBUG and ONE summary line is logged at INFO."""
+        security = load_security_module()
+        
+        mock_logger = Mock()
+        security.logger = mock_logger
+        
+        # Setup memory cache hit for url1
+        security.URL_SAFETY_CACHE["https://mem-hit.com"] = (1, None)
+        
+        # Setup DB cache hit for url2
+        async def fake_to_thread(func, *args, **kwargs):
+            if args and args[0] == "https://db-hit.com":
+                return {"is_safe": 1, "threat_type": None}
+            return None
+        
+        with patch.object(security.asyncio, "to_thread", side_effect=fake_to_thread):
+            urls = ["https://mem-hit.com", "https://db-hit.com", "https://to-scan.com"]
+            mock_client = AsyncMock()
+            security.SAFE_BROWSING_KEY = None
+            
+            await security.scan_urls_batch(urls, email_id="test123", client=mock_client)
+            
+            # Verify DEBUG was used for individual cache hits
+            debug_messages = [call.args[0] for call in mock_logger.debug.call_args_list]
+            self.assertTrue(any("In-memory cache hit" in msg for msg in debug_messages))
+            self.assertTrue(any("DB cache hit" in msg for msg in debug_messages))
+            
+            # Verify INFO was NOT used for individual cache hits
+            info_messages = [call.args[0] for call in mock_logger.info.call_args_list]
+            self.assertFalse(any("In-memory cache hit" in msg for msg in info_messages))
+            self.assertFalse(any("DB cache hit" in msg for msg in info_messages))
+            
+            # Verify ONE summary INFO line was emitted
+            summary_lines = [msg for msg in info_messages if "[SECURITY] URL cache:" in msg]
+            self.assertEqual(len(summary_lines), 1)
+            self.assertIn("3 total, 1 memory hits, 1 db hits, 1 to scan", summary_lines[0])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1180,29 +1180,42 @@ def save_fetched_emails_bulk(user_id: int, rows: list[dict]):
     finally:
         _release_connection(conn)
 
-def get_analyzed_emails(user_id: int, limit: int = None) -> list[dict]:
+def get_analyzed_emails(user_id: int, limit: int = None, include_body: bool = True) -> list[dict]:
     """
     Return all analyzed emails for user joined with custom_labels.
     Now includes retry_queue error_reason for failed emails.
-    Each dict contains: email_id, label_name, bg_color, text_color,
-    scam_score, scam_indicators, is_quarantined, snippet, sender, subject, analyzed_at, body,
-    applied_to_gmail, last_applied_label_id, label_id, status, error_reason
+    When include_body is False, large text fields (body, attachment_details) are omitted.
     """
     conn = _get_connection()
     try:
         cursor = conn.cursor()
-        _execute(cursor,
-            """
-            SELECT ae.*, cl.label_name, cl.bg_color, cl.text_color,
+        if include_body:
+            select_cols = "ae.*"
+        else:
+            select_cols = (
+                "ae.email_id, ae.user_id, ae.label_id, ae.scam_score, ae.scam_indicators, "
+                "ae.is_quarantined, ae.snippet, ae.sender, ae.subject, ae.status, "
+                "ae.analyzed_at, ae.applied_to_gmail, ae.last_applied_label_id, ae.source, "
+                "ae.ml_confidence, ae.provider_used, ae.reasoning, ae.routing_decision, "
+                "ae.v2_score, ae.analysis_status, ae.category_status, ae.url_scan_status, "
+                "ae.urls_total, ae.urls_checked, ae.received_at, ae.user_decision, "
+                "ae.gmail_sync_state, ae.gmail_sync_error, ae.gmail_sync_attempts, "
+                "ae.last_synced_at, ae.attachment_risk"
+            )
+        query = f"""
+            SELECT {select_cols}, cl.label_name, cl.bg_color, cl.text_color,
                    rq.error_reason, rq.retry_count
             FROM analyzed_emails ae
             LEFT JOIN custom_labels cl ON ae.label_id = cl.label_id
             LEFT JOIN retry_queue rq ON ae.email_id = rq.email_id
             WHERE ae.user_id = %s
             ORDER BY COALESCE(NULLIF(ae.received_at, ''), CAST(ae.analyzed_at AS TEXT)) DESC
-            """,
-            (user_id,),
-        )
+        """
+        params = [user_id]
+        if limit is not None:
+            query += " LIMIT %s"
+            params.append(limit)
+        _execute(cursor, query, tuple(params))
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
     except Exception:
@@ -1210,6 +1223,32 @@ def get_analyzed_emails(user_id: int, limit: int = None) -> list[dict]:
         raise
     finally:
         _release_connection(conn)
+
+
+def get_email_body(user_id: int, email_id: str) -> dict | None:
+    """Return email_id, body, and snippet for a specific user-owned email."""
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        _execute(
+            cursor,
+            """
+            SELECT email_id, body, snippet
+            FROM analyzed_emails
+            WHERE email_id = %s AND user_id = %s
+            """,
+            (email_id, user_id),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return dict(row)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _release_connection(conn)
+
 
 
 # ---------- URL CACHE ----------
