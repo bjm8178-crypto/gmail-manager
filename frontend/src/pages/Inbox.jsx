@@ -269,7 +269,7 @@ function Inbox() {
       const data = await res.json();
 
       if (res.ok) {
-        let filtered = data.emails || [];
+        let filtered = (data.emails || []).filter(e => e.status !== 'fetched');
 
         // Client-side search filter
         if (search) {

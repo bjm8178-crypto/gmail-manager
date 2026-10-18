@@ -609,11 +609,12 @@ async def emails_get(request: Request, user: dict = Depends(require_auth)):
         logger.info(f"[EMAILS-GET] Fetching emails for user_id={user_id}")
         include_body = os.getenv("EMAILS_LIST_INCLUDE_BODY", "0") == "1"
         emails = await asyncio.to_thread(get_analyzed_emails, user_id, include_body=include_body)
-        logger.info(f"[EMAILS-GET] Found {len(emails)} emails")
-        if any(not e.get("received_at") for e in emails):
+        analyzed_emails = [e for e in emails if e.get("status") != "fetched"]
+        logger.info(f"[EMAILS-GET] Found {len(analyzed_emails)} analyzed emails")
+        if any(not e.get("received_at") for e in analyzed_emails):
             from gmail import backfill_missing_received_at
             asyncio.create_task(backfill_missing_received_at(user_id, _request_user_email(request)))
-        return {"emails": emails, "count": len(emails)}
+        return {"emails": analyzed_emails, "count": len(analyzed_emails)}
     except Exception as e:
         logger.error(f"[EMAILS-GET ERROR] {type(e).__name__}: {str(e)}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": "Failed to fetch emails. Please try again."})
@@ -626,7 +627,8 @@ async def emails_analyzed(request: Request, user: dict = Depends(require_auth)):
 
     include_body = os.getenv("EMAILS_LIST_INCLUDE_BODY", "0") == "1"
     emails = await asyncio.to_thread(get_analyzed_emails, user_id, include_body=include_body)
-    return {"emails": emails, "count": len(emails)}
+    analyzed_emails = [e for e in emails if e.get("status") != "fetched"]
+    return {"emails": analyzed_emails, "count": len(analyzed_emails)}
 
 
 # ---------- BULK ANALYSIS ENDPOINT WITH SSE ----------
@@ -1894,9 +1896,10 @@ async def emails_stats(request: Request, user: dict = Depends(require_auth)):
     user_id = user["user_id"]
 
     emails = await asyncio.to_thread(get_analyzed_emails, user_id, include_body=False)
-    total_analyzed = len(emails)
-    total_quarantined = sum(1 for e in emails if e.get("is_quarantined") == 1)
-    total_flagged = sum(1 for e in emails if (e.get("scam_score") or 0) >= 30)
+    analyzed_emails = [e for e in emails if e.get("status") != "fetched"]
+    total_analyzed = len(analyzed_emails)
+    total_quarantined = sum(1 for e in analyzed_emails if e.get("is_quarantined") == 1)
+    total_flagged = sum(1 for e in analyzed_emails if (e.get("scam_score") or 0) >= 30)
 
     return {
         "total_analyzed": total_analyzed,
