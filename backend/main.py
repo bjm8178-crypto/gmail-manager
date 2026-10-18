@@ -46,7 +46,7 @@ from slowapi.errors import RateLimitExceeded
 from auth import get_auth_url, consume_oauth_state, handle_callback, is_logged_in, get_credentials, delete_token, get_user_email, migrate_legacy_tokens
 from gmail import fetch_emails, analyze_bulk_ordered, trash_email, delete_email, send_reply
 from database import (
-    init_db, get_analyzed_emails,
+    init_db, get_analyzed_emails, get_email_body,
     get_labels, add_label, delete_label,
     reset_database, mark_email_safe,
     get_delete_mode, set_delete_mode,
@@ -586,13 +586,14 @@ async def emails_fetch(request: Request, user: dict = Depends(require_auth), lim
 
 @app.get("/emails")
 async def emails_get(request: Request, user: dict = Depends(require_auth)):
-    """GET /emails — Returns all cached analyzed emails from SQLite."""
+    """GET /emails — Returns all cached analyzed emails from database."""
     try:
         logger.info("[EMAILS-GET] Request received")
         user_id = user["user_id"]
 
         logger.info(f"[EMAILS-GET] Fetching emails for user_id={user_id}")
-        emails = get_analyzed_emails(user_id)
+        include_body = os.getenv("EMAILS_LIST_INCLUDE_BODY", "0") == "1"
+        emails = await asyncio.to_thread(get_analyzed_emails, user_id, include_body=include_body)
         logger.info(f"[EMAILS-GET] Found {len(emails)} emails")
         return {"emails": emails, "count": len(emails)}
     except Exception as e:
@@ -605,7 +606,8 @@ async def emails_analyzed(request: Request, user: dict = Depends(require_auth)):
     """GET /emails/analyzed — Alias for GET /emails for backward compatibility."""
     user_id = user["user_id"]
 
-    emails = get_analyzed_emails(user_id)
+    include_body = os.getenv("EMAILS_LIST_INCLUDE_BODY", "0") == "1"
+    emails = await asyncio.to_thread(get_analyzed_emails, user_id, include_body=include_body)
     return {"emails": emails, "count": len(emails)}
 
 
@@ -823,7 +825,7 @@ def _apply_label_change(email_id: str, new_label_name: str, user_id: int, user_e
             return {"success": False, "error": "Label not found"}
 
         # Get current email state
-        emails = get_analyzed_emails(user_id)
+        emails = get_analyzed_emails(user_id, include_body=False)
         email = next((e for e in emails if e["email_id"] == email_id), None)
         if not email:
             return {"success": False, "error": "Email not found"}
@@ -1009,7 +1011,7 @@ async def update_email_label(
 
     # Return updated email
     from database import get_analyzed_emails
-    updated_emails = get_analyzed_emails(user_id)
+    updated_emails = await asyncio.to_thread(get_analyzed_emails, user_id, include_body=False)
     updated_email = next((e for e in updated_emails if e["email_id"] == email_id), None)
 
     return {"success": True, "email": updated_email}
@@ -1456,7 +1458,7 @@ async def quarantine_list(request: Request, user: dict = Depends(require_auth)):
     """GET /quarantine — Returns all quarantined emails."""
     user_id = user["user_id"]
 
-    emails = get_analyzed_emails(user_id)
+    emails = await asyncio.to_thread(get_analyzed_emails, user_id, include_body=False)
     quarantined = [e for e in emails if e.get("is_quarantined") == 1]
     return {"emails": quarantined, "count": len(quarantined)}
 
@@ -1466,7 +1468,7 @@ async def quarantine_list(request: Request, user: dict = Depends(require_auth)):
 async def quarantine_mark_safe(email_id: str, request: Request, user: dict = Depends(require_auth)):
     """POST /quarantine/{email_id}/safe — Removes quarantine flag."""
     user_id = user["user_id"]
-    mark_email_safe(email_id, user_id)
+    await asyncio.to_thread(mark_email_safe, email_id, user_id)
     return {"success": True, "message": f"Email {email_id} marked as safe."}
 
 
@@ -1476,10 +1478,11 @@ async def quarantine_delete(email_id: str, request: Request, user: dict = Depend
     """DELETE /quarantine/{email_id} — Delete email using user's preferred mode."""
     user_id = user["user_id"]
 
-    mode = get_delete_mode(user_id)
-    success = delete_email(email_id, user_id, user_email=_request_user_email(request))
+    mode = await asyncio.to_thread(get_delete_mode, user_id)
+    user_email = _request_user_email(request)
+    success = await asyncio.to_thread(delete_email, email_id, user_id, user_email=user_email)
     if success:
-        mark_email_safe(email_id, user_id)
+        await asyncio.to_thread(mark_email_safe, email_id, user_id)
         action = "permanently deleted" if mode == "permanent" else "moved to trash"
         return {"success": True, "message": f"Email {email_id} {action}."}
     return JSONResponse(status_code=500, content={"error": "Failed to delete email."})
@@ -1491,7 +1494,7 @@ async def quarantine_delete(email_id: str, request: Request, user: dict = Depend
 async def scam_alerts(request: Request, min_score: int = 30, user: dict = Depends(require_auth)):
     """GET /scam/alerts?min_score=30 — Returns flagged emails sorted by scam score."""
     user_id = user["user_id"]
-    emails = get_analyzed_emails(user_id)
+    emails = await asyncio.to_thread(get_analyzed_emails, user_id, include_body=False)
     flagged = [e for e in emails if (e.get("scam_score") or 0) >= min_score]
     flagged.sort(key=lambda x: (x.get("scam_score") or 0), reverse=True)
     return {"emails": flagged, "count": len(flagged)}
@@ -1517,8 +1520,8 @@ async def reanalyze_scam_email(
     user_id = user["user_id"]
     # body.force is available for future force-reanalysis logic
 
-    # Fetch the email's current data
-    emails = get_analyzed_emails(user_id)
+    # Fetch the email's current data (include_body=True needed for analysis)
+    emails = await asyncio.to_thread(get_analyzed_emails, user_id, include_body=True)
     email = next((e for e in emails if e["email_id"] == email_id), None)
     if not email:
         return JSONResponse(status_code=404, content={"error": "Email not found"})
@@ -1537,7 +1540,7 @@ async def reanalyze_scam_email(
             body = await asyncio.to_thread(_get_email_body, service, email_id)
 
     # Available labels for classification
-    available_labels_list = get_labels(user_id)
+    available_labels_list = await asyncio.to_thread(get_labels, user_id)
     available_label_names = [lbl["label_name"] for lbl in available_labels_list]
     if not available_label_names:
         return JSONResponse(
@@ -1645,6 +1648,32 @@ async def reanalyze_scam_email(
     }
 
 
+# ---------- EMAIL BODY ON-DEMAND ENDPOINT ----------
+
+@app.get("/emails/{email_id}/body")
+async def email_get_body(email_id: str, request: Request, user: dict = Depends(require_auth)):
+    """
+    GET /emails/{email_id}/body — Load raw body on-demand for a single user-owned email.
+    Returns 404 with generic message if not found or not owned by user.
+    """
+    user_id = user["user_id"]
+    email_data = await asyncio.to_thread(get_email_body, user_id, email_id)
+    if not email_data:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Email not found"},
+            headers={"Cache-Control": "private, no-store"},
+        )
+    return JSONResponse(
+        content={
+            "email_id": email_data["email_id"],
+            "body": email_data.get("body", "") or "",
+            "snippet": email_data.get("snippet", "") or "",
+        },
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
 # ---------- BATCH DELETE ENDPOINT ----------
 
 @app.post("/emails/batch-delete")
@@ -1663,7 +1692,7 @@ async def emails_batch_delete(
     value = body.value
 
     # Get all emails for this user, then filter
-    emails = get_analyzed_emails(user_id)
+    emails = await asyncio.to_thread(get_analyzed_emails, user_id, include_body=False)
 
     if mode == "label":
         matching = [e for e in emails if e.get("label_name") == value]
@@ -1827,8 +1856,7 @@ async def emails_stats(request: Request, user: dict = Depends(require_auth)):
     """GET /emails/stats — Returns summary statistics."""
     user_id = user["user_id"]
 
-
-    emails = get_analyzed_emails(user_id)
+    emails = await asyncio.to_thread(get_analyzed_emails, user_id, include_body=False)
     total_analyzed = len(emails)
     total_quarantined = sum(1 for e in emails if e.get("is_quarantined") == 1)
     total_flagged = sum(1 for e in emails if (e.get("scam_score") or 0) >= 30)

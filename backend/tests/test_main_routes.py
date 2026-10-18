@@ -272,3 +272,88 @@ def test_cors_headers_present():
     
     # CORS preflight should return headers
     assert response.status_code in [200, 204, 405]
+
+
+def test_emails_get_omits_body_by_default():
+    """Test GET /emails passes include_body=False when EMAILS_LIST_INCLUDE_BODY is 0"""
+    from main import app
+    from dependencies import require_auth
+    import os
+
+    app.dependency_overrides[require_auth] = lambda: {"user_id": 1, "email": "test@example.com"}
+    client = TestClient(app)
+
+    try:
+        with patch.dict(os.environ, {"EMAILS_LIST_INCLUDE_BODY": "0"}), \
+             patch('main.get_analyzed_emails', return_value=[{"email_id": "e1", "snippet": "snip"}]) as mock_get:
+            response = client.get("/emails")
+            assert response.status_code == 200
+            data = response.json()
+            assert len(data["emails"]) == 1
+            assert "body" not in data["emails"][0]
+            mock_get.assert_called_once_with(1, include_body=False)
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_emails_get_includes_body_when_flag_enabled():
+    """Test GET /emails passes include_body=True when EMAILS_LIST_INCLUDE_BODY is 1"""
+    from main import app
+    from dependencies import require_auth
+    import os
+
+    app.dependency_overrides[require_auth] = lambda: {"user_id": 1, "email": "test@example.com"}
+    client = TestClient(app)
+
+    try:
+        with patch.dict(os.environ, {"EMAILS_LIST_INCLUDE_BODY": "1"}), \
+             patch('main.get_analyzed_emails', return_value=[{"email_id": "e1", "snippet": "snip", "body": "full"}]) as mock_get:
+            response = client.get("/emails")
+            assert response.status_code == 200
+            data = response.json()
+            assert len(data["emails"]) == 1
+            assert data["emails"][0]["body"] == "full"
+            mock_get.assert_called_once_with(1, include_body=True)
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_email_get_body_endpoint_owner_success():
+    """Test GET /emails/{email_id}/body returns body and snippet with private, no-store Cache-Control"""
+    from main import app
+    from dependencies import require_auth
+
+    app.dependency_overrides[require_auth] = lambda: {"user_id": 1, "email": "test@example.com"}
+    client = TestClient(app)
+
+    try:
+        with patch('main.get_email_body', return_value={"email_id": "e123", "body": "Important text", "snippet": "Important..."}):
+            response = client.get("/emails/e123/body")
+            assert response.status_code == 200
+            assert response.headers.get("Cache-Control") == "private, no-store"
+            data = response.json()
+            assert data["email_id"] == "e123"
+            assert data["body"] == "Important text"
+            assert data["snippet"] == "Important..."
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_email_get_body_endpoint_not_found_or_other_user():
+    """Test GET /emails/{email_id}/body returns 404 when email not found or not owned by user"""
+    from main import app
+    from dependencies import require_auth
+
+    app.dependency_overrides[require_auth] = lambda: {"user_id": 1, "email": "test@example.com"}
+    client = TestClient(app)
+
+    try:
+        with patch('main.get_email_body', return_value=None):
+            response = client.get("/emails/other-user-email/body")
+            assert response.status_code == 404
+            assert response.headers.get("Cache-Control") == "private, no-store"
+            data = response.json()
+            assert "Email not found" in data["error"]
+    finally:
+        app.dependency_overrides.clear()
+

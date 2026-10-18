@@ -175,7 +175,11 @@ export const apiRequest = async (endpoint, options = {}) => {
       const data = await clonedResponse.json();
       
       // Get TTL from config or use default
-      const cacheConfig = CACHE_CONFIG[endpoint] || {};
+      let cacheConfig = CACHE_CONFIG[endpoint];
+      if (!cacheConfig && endpoint.startsWith('/emails/') && endpoint.endsWith('/body')) {
+        cacheConfig = CACHE_CONFIG['/emails/body'];
+      }
+      cacheConfig = cacheConfig || {};
       if (generation === cacheGeneration && token === getAuthToken()) apiCache.set(endpoint, options.params || {}, data, cacheConfig.ttl);
       
       // Return a new response with the cached data

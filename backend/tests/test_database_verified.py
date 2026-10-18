@@ -254,3 +254,74 @@ def test_get_dead_letter_queue_empty_for_no_exhausted(mock_pg_connection):
         result = get_dead_letter_queue(user_id=1)
         
         assert result == []
+
+
+def test_get_analyzed_emails_include_body_false(mock_pg_connection):
+    """Test get_analyzed_emails with include_body=False excludes raw body column in SQL query"""
+    mock_conn, mock_cursor = mock_pg_connection
+    mock_cursor.fetchall.return_value = [
+        {"email_id": "e1", "user_id": 1, "subject": "Hello", "snippet": "snippet"}
+    ]
+
+    with patch('database._pg_pool') as mock_pool:
+        mock_pool.getconn.return_value = mock_conn
+        from database import get_analyzed_emails
+
+        emails = get_analyzed_emails(user_id=1, include_body=False)
+        assert len(emails) == 1
+        assert "body" not in emails[0]
+        sql_executed = mock_cursor.execute.call_args[0][0]
+        assert "ae.*" not in sql_executed
+        assert "ae.snippet" in sql_executed
+
+
+def test_get_analyzed_emails_include_body_true(mock_pg_connection):
+    """Test get_analyzed_emails with include_body=True selects ae.*"""
+    mock_conn, mock_cursor = mock_pg_connection
+    mock_cursor.fetchall.return_value = [
+        {"email_id": "e1", "user_id": 1, "subject": "Hello", "body": "full body"}
+    ]
+
+    with patch('database._pg_pool') as mock_pool:
+        mock_pool.getconn.return_value = mock_conn
+        from database import get_analyzed_emails
+
+        emails = get_analyzed_emails(user_id=1, include_body=True)
+        assert len(emails) == 1
+        sql_executed = mock_cursor.execute.call_args[0][0]
+        assert "ae.*" in sql_executed
+
+
+def test_get_email_body_returns_body_for_owner(mock_pg_connection):
+    """Test get_email_body returns body and snippet scoped to user_id"""
+    mock_conn, mock_cursor = mock_pg_connection
+    mock_cursor.fetchone.return_value = {
+        "email_id": "e123",
+        "body": "Secret content",
+        "snippet": "Secret...",
+    }
+
+    with patch('database._pg_pool') as mock_pool:
+        mock_pool.getconn.return_value = mock_conn
+        from database import get_email_body
+
+        res = get_email_body(user_id=42, email_id="e123")
+        assert res is not None
+        assert res["body"] == "Secret content"
+        assert res["snippet"] == "Secret..."
+        params = mock_cursor.execute.call_args[0][1]
+        assert params == ("e123", 42)
+
+
+def test_get_email_body_returns_none_if_not_found(mock_pg_connection):
+    """Test get_email_body returns None when email does not exist or user does not own it"""
+    mock_conn, mock_cursor = mock_pg_connection
+    mock_cursor.fetchone.return_value = None
+
+    with patch('database._pg_pool') as mock_pool:
+        mock_pool.getconn.return_value = mock_conn
+        from database import get_email_body
+
+        res = get_email_body(user_id=42, email_id="nonexistent")
+        assert res is None
+
