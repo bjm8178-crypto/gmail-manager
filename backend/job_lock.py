@@ -48,6 +48,34 @@ def release_user_job_lock(lock: asyncio.Lock):
         lock.release()
 
 
+# Per-user fetch locks: {user_id: asyncio.Lock}
+_user_fetch_locks: Dict[int, asyncio.Lock] = {}
+_fetch_locks_lock = asyncio.Lock()
+
+
+async def acquire_user_fetch_lock(user_id: int, timeout: float = 0.1) -> Optional[asyncio.Lock]:
+    """
+    Try to acquire the fetch lock for a user.
+    Prevents concurrent Gmail fetch operations for the same account.
+    """
+    async with _fetch_locks_lock:
+        if user_id not in _user_fetch_locks:
+            _user_fetch_locks[user_id] = asyncio.Lock()
+        lock = _user_fetch_locks[user_id]
+
+    try:
+        acquired = await asyncio.wait_for(lock.acquire(), timeout=timeout)
+        return lock if acquired else None
+    except asyncio.TimeoutError:
+        return None
+
+
+def release_user_fetch_lock(lock: Optional[asyncio.Lock]):
+    """Release a previously acquired user fetch lock."""
+    if lock and lock.locked():
+        lock.release()
+
+
 async def register_inflight_email(user_id: int, email_id: str) -> bool:
     """
     Register an email as in-flight for analysis.
