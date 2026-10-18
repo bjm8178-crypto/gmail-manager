@@ -62,6 +62,7 @@ from job_lock import (
     clear_user_inflight_emails, get_job_lock_status,
 )
 from ml_inference import load_active_model
+import predict
 from ai_router import ai_router, REWRITE_PROMPT, CLASSIFICATION_PROMPT, get_provider_status
 from dependencies import require_auth
 from jwt_auth import create_access_token, get_user_from_token
@@ -128,6 +129,19 @@ async def lifespan(app: FastAPI):
         logger.info("[STARTUP] load_active_model() complete")
     except Exception as e:
         logger.error(f"[STARTUP ERROR] load_active_model() failed: {e}", exc_info=True)
+
+    # Preload scam_classifier_v2 ML model in background (Task 3)
+    if os.getenv("ML_PRELOAD", "1").strip().lower() not in {"0", "false", "no", "off"}:
+        async def _preload_model():
+            try:
+                await asyncio.to_thread(predict.load_model)
+            except Exception as e:
+                logger.warning(f"[STARTUP] ML model preload failed or skipped: {e}")
+        try:
+            asyncio.create_task(_preload_model())
+            logger.info("[STARTUP] Dispatched background ML model preload")
+        except Exception as e:
+            logger.warning(f"[STARTUP] Could not dispatch ML preload task: {e}")
     
     # Import legacy file-based tokens into the DB (no-op on ephemeral hosts with no files)
     try:
