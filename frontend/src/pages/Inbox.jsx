@@ -141,8 +141,10 @@ function Inbox() {
   labelFilterRef.current = labelFilter;
   sortByRef.current = sortBy;
 
-  // Analysis limit (custom input value)
+  // Analysis limit (custom input value, max 9999)
   const [analyzeLimit, setAnalyzeLimit] = useState(100);
+  const parsedLimit = parseInt(analyzeLimit, 10);
+  const isAnalyzeDisabled = isAnalyzing || analyzeLimit === '' || isNaN(parsedLimit) || parsedLimit <= 0;
   const [showCustomInput, setShowCustomInput] = useState(false);
 
   // Batch delete state
@@ -457,8 +459,14 @@ function Inbox() {
       }
     } catch { /* proceed and let server-side guard catch it */ }
 
+    const numLimit = parseInt(analyzeLimit, 10);
+    if (isNaN(numLimit) || numLimit <= 0) {
+      return;
+    }
+    const finalLimit = Math.min(numLimit, 9999);
+
     setShowNoLabelsWarning(false);
-    startAnalysis(analyzeLimit);
+    startAnalysis(finalLimit);
   }
 
   // ---------- PHASE 3: BULK SELECTION HANDLERS ----------
@@ -584,27 +592,38 @@ function Inbox() {
                 value={analyzeLimit}
                 onChange={(e) => {
                   const val = e.target.value.replace(/[^0-9]/g, '');
-                  const num = parseInt(val) || 0;
-                  setAnalyzeLimit(Math.min(Math.max(num, 1), 1000));
+                  if (val === '') {
+                    setAnalyzeLimit('');
+                    return;
+                  }
+                  const num = parseInt(val, 10);
+                  if (num > 9999) {
+                    setAnalyzeLimit(9999);
+                  } else {
+                    setAnalyzeLimit(val.length > 1 && val.startsWith('0') ? num : val);
+                  }
                 }}
                 disabled={isAnalyzing}
                 className="neu-input px-3 py-2 text-sm w-24 text-center touch-manipulation"
                 style={{ minHeight: '44px' }}
-                placeholder="1-1000"
-                title="Number of emails to analyze (1-1000)"
+                placeholder="1-9999"
+                title="Number of emails to analyze (1-9999)"
               />
               <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-3 py-1.5 bg-navy-700 text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-10"
                    style={{ color: 'var(--color-text-primary)', border: '1px solid var(--border-default)' }}>
-                Enter number of emails (1-1000)
+                Enter number of emails (1-9999)
               </div>
             </div>
             <button
               onClick={handleAnalyze}
-              disabled={isAnalyzing}
-              className="btn-primary px-4 py-2 text-sm flex-shrink-0 flex items-center justify-center gap-2 touch-manipulation active:scale-95 transition-transform"
+              disabled={isAnalyzeDisabled}
+              className={`btn-primary px-4 py-2 text-sm flex-shrink-0 flex items-center justify-center gap-2 touch-manipulation transition-transform ${
+                isAnalyzeDisabled ? 'opacity-50 cursor-not-allowed' : 'active:scale-95'
+              }`}
               style={{
-                background: isAnalyzing ? 'var(--color-text-muted)' : undefined,
-                boxShadow: isAnalyzing ? 'none' : undefined,
+                background: isAnalyzeDisabled ? 'var(--color-text-muted)' : undefined,
+                boxShadow: isAnalyzeDisabled ? 'none' : undefined,
+                cursor: isAnalyzeDisabled ? 'not-allowed' : 'pointer',
                 minHeight: '44px',
                 minWidth: '140px',
               }}
