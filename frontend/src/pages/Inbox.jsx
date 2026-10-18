@@ -21,11 +21,54 @@ import Pagination from '../components/Pagination';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 
 const SORT_OPTIONS = [
-  { value: 'newest', label: 'Newest First' },
+  { value: 'newest', label: 'Recently Analyzed' },
+  { value: 'email_date', label: 'Email Date (Newest First)' },
   { value: 'scam_score', label: 'Scam Score' },
   { value: 'label', label: 'By Label' },
 ];
 const LIMIT_OPTIONS = [25, 50, 100];
+
+function getTime(val) {
+  if (!val) return 0;
+  const t = new Date(val).getTime();
+  return isNaN(t) ? 0 : t;
+}
+
+function sortByBatchAndDate(list) {
+  if (!list || list.length <= 1) return list;
+  const items = [...list];
+  // Sort primarily by analyzed_at descending
+  items.sort((a, b) => getTime(b.analyzed_at) - getTime(a.analyzed_at));
+
+  // Group into batches: emails analyzed within 4000ms of each other belong to the same batch
+  let currentBatchId = 0;
+  let lastTime = getTime(items[0]?.analyzed_at);
+
+  for (let i = 0; i < items.length; i++) {
+    const currentTime = getTime(items[i].analyzed_at);
+    if (Math.abs(lastTime - currentTime) > 4000) {
+      currentBatchId++;
+    }
+    items[i]._batchId = currentBatchId;
+    lastTime = currentTime;
+  }
+
+  // Sort batches newest first; within each batch, newest received_at first
+  items.sort((a, b) => {
+    if (a._batchId !== b._batchId) {
+      return a._batchId - b._batchId;
+    }
+    const recA = getTime(a.received_at || a.date || a.analyzed_at);
+    const recB = getTime(b.received_at || b.date || b.analyzed_at);
+    return recB - recA;
+  });
+
+  for (let i = 0; i < items.length; i++) {
+    delete items[i]._batchId;
+  }
+
+  return items;
+}
 
 function Inbox() {
   const navigate = useNavigate();
@@ -219,12 +262,19 @@ function Inbox() {
         }
 
         // Client-side sort
-        if (sort === 'scam_score') {
+        if (sort === 'newest') {
+          filtered = sortByBatchAndDate(filtered);
+        } else if (sort === 'email_date') {
+          filtered.sort((a, b) => {
+            const recA = getTime(a.received_at || a.date || a.analyzed_at);
+            const recB = getTime(b.received_at || b.date || b.analyzed_at);
+            return recB - recA;
+          });
+        } else if (sort === 'scam_score') {
           filtered.sort((a, b) => (b.scam_score || 0) - (a.scam_score || 0));
         } else if (sort === 'label') {
           filtered.sort((a, b) => (a.label_name || '').localeCompare(b.label_name || ''));
         }
-        // 'newest' is default from backend (ORDER BY analyzed_at DESC)
 
         setEmails(filtered);
         setTotalCount(data.count || 0);
