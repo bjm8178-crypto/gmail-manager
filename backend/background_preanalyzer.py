@@ -75,6 +75,22 @@ def is_preanalyzer_paused() -> bool:
     return not _pause_event.is_set()
 
 
+def _clean_json_text(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start:end+1]
+    return text
+
+
 async def call_openrouter_single(
     client: httpx.AsyncClient,
     api_key: str,
