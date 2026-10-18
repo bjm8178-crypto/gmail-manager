@@ -135,6 +135,47 @@ def get_gmail_service_cached(user_email: str = None):
     return svc
 
 
+def list_message_ids(
+    user_id: int | str | None = None,
+    max_results: int = 50,
+    page_token: str | None = None,
+    user_email: str | None = None,
+) -> tuple[list[str], str | None]:
+    """
+    List message IDs from Gmail (only calls users().messages().list()).
+    Fast, lightweight response containing only message IDs and nextPageToken.
+    Returns (list_of_ids, next_page_token).
+    """
+    if not user_email:
+        if isinstance(user_id, str) and "@" in user_id:
+            user_email = user_id
+        elif user_id is not None:
+            try:
+                user_email = get_user_email_by_id(int(user_id))
+            except Exception:
+                user_email = None
+
+    service = get_gmail_service(user_email)
+    if not service:
+        return [], None
+
+    try:
+        response = service.users().messages().list(
+            userId="me",
+            maxResults=max_results,
+            pageToken=page_token if page_token else None,
+        ).execute()
+
+        messages = response.get("messages", [])
+        message_ids = [msg["id"] for msg in messages if "id" in msg]
+        next_page_token = response.get("nextPageToken")
+        logger.info(f"[GMAIL] list_message_ids: found {len(message_ids)} IDs, next_page_token={next_page_token}")
+        return message_ids, next_page_token
+    except Exception as e:
+        logger.info(f"[GMAIL] Error listing message IDs: {e}")
+        return [], None
+
+
 def fetch_emails(limit: int = 50, page_token: str | None = None, user_email: str = None) -> dict:
     """
     Fetch emails from Gmail in reverse chronological order (newest first).
@@ -143,55 +184,37 @@ def fetch_emails(limit: int = 50, page_token: str | None = None, user_email: str
     Args:
         limit: Maximum number of emails to retrieve (default 50)
         page_token: Gmail pagination token for fetching the next page
+        user_email: User's gmail address
 
     Returns:
         Dict with keys:
           - emails: list[dict] — the parsed emails
           - next_page_token: str | None — cursor for the next scan
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    service = get_gmail_service(user_email)
-    if not service:
-        return {"emails": [], "next_page_token": None}
-
     try:
-        # Step 1: Collect message IDs (lightweight API call — only returns id + threadId)
         message_ids = []
         current_token = page_token
-
-        import sys
 
         logger.info(f"[GMAIL] Starting list loop... limit={limit}, token={page_token}")
 
         while len(message_ids) < limit:
-            logger.info(f"[GMAIL] Requesting list batch...")
-            response = service.users().messages().list(
-                userId="me",
-                maxResults=min(limit - len(message_ids), 50),
-                pageToken=current_token if current_token else None,
-            ).execute()
-
-            messages = response.get("messages", [])
-            logger.info(f"[GMAIL] Received batch of {len(messages)} messages.")
-            if not messages:
+            batch_limit = min(limit - len(message_ids), 50)
+            ids, next_token = list_message_ids(
+                max_results=batch_limit,
+                page_token=current_token,
+                user_email=user_email,
+            )
+            if not ids:
                 break
-
-            message_ids.extend([msg["id"] for msg in messages])
-
-            current_token = response.get("nextPageToken")
-            logger.info(f"[GMAIL] current message batch size is {len(message_ids)}. Next token is {current_token}")
+            message_ids.extend(ids)
+            current_token = next_token
             if not current_token:
                 break
 
         message_ids = message_ids[:limit]
-        logger.info(f"[GMAIL] Got {len(message_ids)} message IDs. Fetching details via batch HTTP...")
+        logger.info(f"[GMAIL] Got {len(message_ids)} message IDs. Fetching details...")
 
-        # Step 2: Fetch full details using Gmail's batch endpoint.
-        # Gmail enforces a hard cap of 50 sub-requests per batch, so we chunk
-        # into groups of 50 and run those chunks concurrently across threads
-        # (each thread builds its own Gmail service instance to avoid
-        # httplib2 shared-connection deadlock).
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         creds = get_credentials(user_email)
         chunks = [message_ids[i:i + 50] for i in range(0, len(message_ids), 50)]
         collected = []
@@ -203,17 +226,15 @@ def fetch_emails(limit: int = 50, page_token: str | None = None, user_email: str
             for future in as_completed(future_to_chunk):
                 collected.extend(future.result())
 
-        # Preserve original order (reverse-chronological from Gmail)
         id_order = {mid: idx for idx, mid in enumerate(message_ids)}
         collected.sort(key=lambda e: id_order.get(e["id"], 999))
 
-        logger.info(f"[GMAIL] Fetched {len(collected)} emails (batched). Next cursor: {current_token}")
+        logger.info(f"[GMAIL] Fetched {len(collected)} emails. Next cursor: {current_token}")
 
         return {
             "emails": collected,
             "next_page_token": current_token,
         }
-
     except Exception as e:
         logger.info(f"[GMAIL] Error fetching emails: {e}")
         return {"emails": [], "next_page_token": None}
@@ -260,13 +281,28 @@ def _get_email_details_batch_threadsafe(creds, email_ids: list[str]) -> list[dic
         return []
 
 
-def _get_email_details_batch(service, email_ids: list[str]) -> list[dict]:
+def _get_email_details_batch(service_or_user, email_ids: list[str]) -> list[dict]:
     """
     Fetch lightweight metadata for up to 50 emails in a single Gmail
     BatchHttpRequest. Gmail caps batches at 50 sub-requests; callers are
     responsible for chunking larger ID lists before calling this.
+    Accepts either a Gmail service instance or user_id/user_email.
     """
     if not email_ids:
+        return []
+
+    if hasattr(service_or_user, "users") and hasattr(service_or_user, "new_batch_http_request"):
+        service = service_or_user
+    else:
+        user_email = service_or_user if isinstance(service_or_user, str) and "@" in service_or_user else None
+        if not user_email and service_or_user is not None:
+            try:
+                user_email = get_user_email_by_id(int(service_or_user))
+            except Exception:
+                user_email = None
+        service = get_gmail_service(user_email)
+
+    if not service:
         return []
 
     import time
@@ -353,6 +389,60 @@ def _get_email_details(service, email_id: str) -> dict | None:
     except Exception as e:
         logger.info(f"[GMAIL] Error fetching email {email_id}: {e}")
         return None
+
+
+def _fetch_email_details(
+    message_ids: list[str],
+    user_id: int | str | None = None,
+    user_email: str | None = None,
+) -> list[dict]:
+    """
+    Fetch lightweight metadata for message_ids.
+    Respects FETCH_BATCH setting:
+      - FETCH_BATCH=1: uses batch HTTP requests (up to 50 per batch)
+      - FETCH_BATCH=0: uses individual get requests
+    """
+    if not message_ids:
+        return []
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if not user_email and user_id is not None:
+        if isinstance(user_id, str) and "@" in user_id:
+            user_email = user_id
+        else:
+            try:
+                user_email = get_user_email_by_id(int(user_id))
+            except Exception:
+                user_email = None
+
+    creds = get_credentials(user_email)
+
+    if FETCH_BATCH:
+        chunks = [message_ids[i:i + 50] for i in range(0, len(message_ids), 50)]
+        collected = []
+        with ThreadPoolExecutor(max_workers=min(4, len(chunks) or 1)) as executor:
+            future_to_chunk = {
+                executor.submit(_get_email_details_batch_threadsafe, creds, chunk): chunk
+                for chunk in chunks
+            }
+            for future in as_completed(future_to_chunk):
+                collected.extend(future.result())
+    else:
+        collected = []
+        with ThreadPoolExecutor(max_workers=min(4, len(message_ids) or 1)) as executor:
+            future_to_id = {
+                executor.submit(_get_email_details_threadsafe, creds, mid): mid
+                for mid in message_ids
+            }
+            for future in as_completed(future_to_id):
+                res = future.result()
+                if res:
+                    collected.append(res)
+
+    id_order = {mid: idx for idx, mid in enumerate(message_ids)}
+    collected.sort(key=lambda e: id_order.get(e["id"], 999))
+    return collected
 
 
 def _get_email_body(service, email_id: str) -> str:
@@ -1248,42 +1338,59 @@ async def _fetch_new_emails(limit: int, user_id: int, user_email: str):
     """Fetch newest pages until ``limit`` unanalyzed emails are collected."""
     new_emails = []
     skipped_count = 0
-    fetched_count = 0
     page_token = None
+    page_size = min(50, max(limit * 2, 10))
 
     while len(new_emails) < limit:
-        fetch_result = await asyncio.wait_for(
+        ids, next_page_token = await asyncio.wait_for(
             asyncio.to_thread(
-                fetch_emails,
-                limit=limit - len(new_emails),
+                list_message_ids,
+                user_id=user_id,
+                max_results=page_size,
                 page_token=page_token,
                 user_email=user_email,
             ),
             timeout=60,
         )
-        fetched_emails = fetch_result["emails"]
-        fetched_count += len(fetched_emails)
+        if not ids:
+            break
 
         if FETCH_BATCH:
-            ids = [e["id"] for e in fetched_emails]
             analyzed_ids = await asyncio.to_thread(get_analyzed_email_ids, user_id, ids)
-            for email in fetched_emails:
-                if email["id"] in analyzed_ids:
+            unseen_ids = []
+            for mid in ids:
+                if mid in analyzed_ids:
                     skipped_count += 1
                 else:
-                    new_emails.append(email)
+                    unseen_ids.append(mid)
         else:
-            for email in fetched_emails:
-                if is_already_analyzed(email["id"], user_id):
+            unseen_ids = []
+            for mid in ids:
+                is_analyzed = await asyncio.to_thread(is_already_analyzed, mid, user_id)
+                if is_analyzed:
                     skipped_count += 1
                 else:
-                    new_emails.append(email)
+                    unseen_ids.append(mid)
 
-        next_page_token = fetch_result.get("next_page_token")
-        if not fetched_emails or not next_page_token:
+        if unseen_ids:
+            needed = limit - len(new_emails)
+            ids_to_fetch = unseen_ids[:needed]
+            details = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _fetch_email_details,
+                    ids_to_fetch,
+                    user_id=user_id,
+                    user_email=user_email,
+                ),
+                timeout=60,
+            )
+            new_emails.extend(details)
+
+        if not next_page_token:
             break
         page_token = next_page_token
 
+    fetched_count = len(new_emails)
     return new_emails, skipped_count, fetched_count
 
 
