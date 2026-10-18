@@ -1982,6 +1982,44 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                 await persist(label_id=None, scam_score=None, scam_indicators="[]", is_quarantined=0,
                         status="fetched", received_at=received_at, analysis_status="pending")
 
+            # Fast path: If email was already pre-analyzed by background worker, reuse results
+            if precomputed_ai_result is None and email.get("analysis_status") == "pre_analyzed" and email.get("scam_score") is not None:
+                precomputed_label = ""
+                lid = email.get("label_id")
+                if lid and label_id_map:
+                    for name, m_id in label_id_map.items():
+                        if m_id == lid:
+                            precomputed_label = name
+                            break
+                if not precomputed_label and lid:
+                    from database import get_label_by_id
+                    lbl_obj = await asyncio.to_thread(get_label_by_id, user_id, lid)
+                    if lbl_obj:
+                        precomputed_label = lbl_obj.get("label_name", "")
+
+                ind_raw = email.get("scam_indicators")
+                indicators = []
+                if ind_raw:
+                    try:
+                        indicators = json.loads(ind_raw) if isinstance(ind_raw, str) else ind_raw
+                    except Exception:
+                        indicators = []
+
+                precomputed_ai_result = {
+                    "provider_used": email.get("provider_used") or "openrouter_preanalyzer",
+                    "data": {
+                        "label": precomputed_label,
+                        "scam_score": email.get("scam_score"),
+                        "scam_indicators": indicators,
+                        "reasoning": email.get("reasoning") or "",
+                    }
+                }
+                if email.get("url_scan_status"):
+                    url_scan_status = email.get("url_scan_status")
+                    urls_total = email.get("urls_total") or 0
+                    urls_checked = email.get("urls_checked") or 0
+                    url_threat_confirmed = (url_scan_status == "threat_detected")
+
             async def run_ai_cascade():
                 nonlocal precomputed_ai_result
                 if precomputed_ai_result is not None:
@@ -2070,7 +2108,7 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                     precomputed_ai_result = None
                 else:
                     precomputed_ai_result = ai_res
-            else:
+            elif precomputed_ai_result is None:
                 t_url_start = time.perf_counter()
                 urls = list(dict.fromkeys(await asyncio.to_thread(extract_urls, body)))
                 urls_total = len(urls)

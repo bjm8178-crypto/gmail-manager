@@ -689,6 +689,8 @@ async def emails_analyze_bulk(request: Request, user: dict = Depends(require_aut
     event_queue: asyncio.Queue = asyncio.Queue()
 
     async def run_bulk_job_in_background():
+        from background_preanalyzer import pause_preanalyzer, resume_preanalyzer
+        pause_preanalyzer()
         try:
             async for event in analyze_bulk_ordered(limit=limit, user_id=user_id, run_id=run_id):
                 job_state["events"].append(event)
@@ -705,6 +707,7 @@ async def emails_analyze_bulk(request: Request, user: dict = Depends(require_aut
             job_state["error"] = str(e)
             await event_queue.put({"type": "error", "error": str(e)})
         finally:
+            resume_preanalyzer()
             await event_queue.put(None)  # Sentinel to close SSE
             await clear_user_inflight_emails(user_id)
             release_user_job_lock(job_lock)
@@ -789,6 +792,14 @@ async def emails_fetch_only(request: Request, user: dict = Depends(require_auth)
         async for event in fetch_only_pipeline(limit=limit, user_id=user_id):
             final_event = event
 
+        # Auto-trigger background preanalyzer if prefetch
+        if prefetch:
+            try:
+                from background_preanalyzer import run_background_preanalyzer
+                asyncio.create_task(run_background_preanalyzer(user_id))
+            except Exception as e:
+                logger.info(f"[FETCH-ONLY] Could not launch background preanalyzer: {e}")
+
         return JSONResponse(content=final_event)
     finally:
         release_user_fetch_lock(fetch_lock)
@@ -819,6 +830,8 @@ async def emails_label_only(request: Request, user: dict = Depends(require_auth)
         return JSONResponse(status_code=400, content={"error": "no_labels"})
     
     from gmail import label_only_pipeline
+    from background_preanalyzer import pause_preanalyzer, resume_preanalyzer
+    pause_preanalyzer()
     
     try:
         final_event = {"analyzed": 0, "failed": 0}
@@ -827,9 +840,19 @@ async def emails_label_only(request: Request, user: dict = Depends(require_auth)
         
         return JSONResponse(content=final_event)
     finally:
+        resume_preanalyzer()
         await clear_user_inflight_emails(user_id)
         release_user_job_lock(job_lock)
         logger.info(f"[JOB_LOCK] Released label-only lock for user {user_id}")
+
+
+@app.post("/emails/preanalyze")
+async def emails_trigger_preanalyze(user: dict = Depends(require_auth)):
+    """POST /emails/preanalyze - Trigger background preanalyzer with 20-worker pool."""
+    user_id = user["user_id"]
+    from background_preanalyzer import run_background_preanalyzer
+    count = await run_background_preanalyzer(user_id)
+    return JSONResponse(content={"status": "started", "queued": count})
 
 
 

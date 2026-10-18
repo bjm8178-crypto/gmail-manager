@@ -1064,6 +1064,37 @@ def get_emails_by_status(user_id: int, status: str, limit: int = None) -> list[d
         _release_connection(conn)
 
 
+def get_unpreanalyzed_emails(user_id: int, limit: int = None) -> list[dict]:
+    """
+    Return emails with status='fetched' that have NOT yet been pre-analyzed.
+    Ordered by received_at / analyzed_at DESC (newest first).
+    """
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        query = """SELECT * FROM analyzed_emails
+                   WHERE user_id = %s AND status = 'fetched'
+                     AND (analysis_status IS NULL OR analysis_status != 'pre_analyzed')
+                   ORDER BY COALESCE(NULLIF(received_at, ''), CAST(analyzed_at AS TEXT)) DESC"""
+        params = (user_id,)
+        if limit is not None:
+            query += " LIMIT %s"
+            params += (limit,)
+        _execute(cursor, query, params)
+        rows = [dict(row) for row in cursor.fetchall()]
+        for row in rows:
+            row["id"] = row["email_id"]
+            row["from"] = row["sender"] or ""
+            for key in ("snippet", "sender", "subject", "body"):
+                row[key] = row[key] or ""
+        return rows
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _release_connection(conn)
+
+
 def get_emails_by_ids(user_id: int, email_ids: list[str]) -> list[dict]:
     """
     Return specific emails by their IDs (exact retry targets).

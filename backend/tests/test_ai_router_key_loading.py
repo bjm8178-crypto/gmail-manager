@@ -315,3 +315,61 @@ def test_label_only_returns_canonical_label(monkeypatch):
 
     assert asyncio.run(router.label_only("s@x.com", "subj", "body", ["Inbox", "Spam"])) == "Spam"
     assert asyncio.run(router.label_only("s@x.com", "subj", "body", [])) is None
+
+
+def test_background_preanalyzer_key_loading_and_pause_and_failover(monkeypatch):
+    """Test background preanalyzer key loading, pause/resume lock, and model failover."""
+    import asyncio
+    from background_preanalyzer import (
+        get_background_openrouter_keys,
+        get_background_safebrowsing_key,
+        pause_preanalyzer,
+        resume_preanalyzer,
+        is_preanalyzer_paused,
+        call_openrouter_with_failover,
+        PRIMARY_MODEL,
+        FALLBACK_MODEL,
+    )
+
+    # 1. Comma-separated Option B loading
+    monkeypatch.setenv("OPENROUTER_BACKGROUND_KEYS", "key-1, key-2, key-3 ,, key-4")
+    monkeypatch.setenv("BACKGROUND_SAFE_BROWSING_API_KEY", "bg-safebrowsing-key-123")
+    keys = get_background_openrouter_keys()
+    assert keys == ["key-1", "key-2", "key-3", "key-4"]
+    assert get_background_safebrowsing_key() == "bg-safebrowsing-key-123"
+
+    # 2. Pause / Resume control
+    resume_preanalyzer()
+    assert not is_preanalyzer_paused()
+    pause_preanalyzer()
+    assert is_preanalyzer_paused()
+    resume_preanalyzer()
+    assert not is_preanalyzer_paused()
+
+    # 3. Model Failover: primary fails, fallback succeeds
+    calls = []
+
+    async def fake_call_openrouter(client, api_key, prompt, model):
+        calls.append(model)
+        if model == PRIMARY_MODEL:
+            raise ValueError("Nemotron 503 Overloaded")
+        return {
+            "label": "Work",
+            "scam_score": 5,
+            "scam_indicators": [],
+            "reasoning": "Legitimate work email",
+        }
+
+    monkeypatch.setattr("background_preanalyzer.call_openrouter_single", fake_call_openrouter)
+
+    class DummyClient:
+        pass
+
+    async def run_failover():
+        return await call_openrouter_with_failover(DummyClient(), "test-key", "test prompt")
+
+    res, used_model = asyncio.run(run_failover())
+    assert used_model == FALLBACK_MODEL
+    assert res["label"] == "Work"
+    assert res["scam_score"] == 5
+    assert calls == [PRIMARY_MODEL, FALLBACK_MODEL]

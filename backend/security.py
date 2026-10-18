@@ -92,7 +92,8 @@ def _extract_domain(url: str) -> str | None:
 
 
 async def scan_urls_batch(urls: list[str], email_id: str,
-                          client: httpx.AsyncClient) -> dict[str, dict]:
+                          client: httpx.AsyncClient,
+                          api_key: str = None) -> dict[str, dict]:
     """
     Check multiple URLs against Google Safe Browsing API v4 in a single batch request.
     
@@ -170,7 +171,8 @@ async def scan_urls_batch(urls: list[str], email_id: str,
         return results
     
     # Step 2: API key check
-    if not SAFE_BROWSING_KEY or SAFE_BROWSING_KEY == "your_key_here":
+    key_to_use = api_key or SAFE_BROWSING_KEY
+    if not key_to_use or key_to_use == "your_key_here":
         logger.info(f"[SECURITY] WARNING: Safe Browsing API key not configured. {len(uncached_urls)} URLs unavailable")
         for url in uncached_urls:
             results[url] = {
@@ -185,7 +187,7 @@ async def scan_urls_batch(urls: list[str], email_id: str,
     
     # Step 3: Build batch request
     endpoint = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
-    headers = {"x-goog-api-key": SAFE_BROWSING_KEY}
+    headers = {"x-goog-api-key": key_to_use}
     body = {
         "client": {
             "clientId": "gmail-manager",
