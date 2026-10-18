@@ -73,7 +73,7 @@ function sortByBatchAndDate(list) {
 function Inbox() {
   const navigate = useNavigate();
   const toast = useToast();
-  const { isAnalyzing, isInitializing, progress, total, stats, currentEmail, startAnalysis, clearStats, error: analysisError, clearError } = useAnalysis();
+  const { isAnalyzing, isInitializing, progress, total, stats, currentEmail, startAnalysis, prefetchEmails, clearStats, error: analysisError, clearError } = useAnalysis();
 
   // Email data
   const [emails, setEmails] = useState([]);
@@ -168,6 +168,29 @@ function Inbox() {
   useEffect(() => {
     verifyAndFetch();
   }, []);
+
+  // ---------- BACKGROUND PRE-FETCH ----------
+  // Silently downloads email headers/bodies after page loads so Analyze runs instantly
+  useEffect(() => {
+    if (loading || isAnalyzing) return;
+
+    const timer = setTimeout(() => {
+      if (prefetchEmails) {
+        prefetchEmails(25);
+      }
+    }, 3000);
+
+    const interval = setInterval(() => {
+      if (prefetchEmails) {
+        prefetchEmails(25);
+      }
+    }, 180000);
+
+    return () => {
+      clearTimeout(timer);
+      clearInterval(interval);
+    };
+  }, [loading, isAnalyzing, prefetchEmails]);
 
   // Refresh email list when analysis completes — fires exactly once per run
   useEffect(() => {

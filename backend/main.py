@@ -58,6 +58,7 @@ from database import (
 )
 from job_lock import (
     acquire_user_job_lock, release_user_job_lock,
+    acquire_user_fetch_lock, release_user_fetch_lock,
     register_inflight_email, unregister_inflight_email,
     clear_user_inflight_emails, get_job_lock_status,
 )
@@ -768,18 +769,27 @@ async def get_bulk_status(job_id: str, user: dict = Depends(require_auth)):
 
 
 @app.post("/emails/fetch-only")
-async def emails_fetch_only(request: Request, user: dict = Depends(require_auth), limit: int = 50):
+async def emails_fetch_only(request: Request, user: dict = Depends(require_auth), limit: int = 50, prefetch: bool = False):
     """POST /emails/fetch-only - Fetch emails from Gmail, save as status='fetched' (no AI)"""
     user_id = user["user_id"]
 
-    
-    from gmail import fetch_only_pipeline
-    
-    final_event = {"fetched": 0, "skipped": 0}
-    async for event in fetch_only_pipeline(limit=limit, user_id=user_id):
-        final_event = event
-    
-    return JSONResponse(content=final_event)
+    # Concurrency guard: Only one fetch per user at a time
+    timeout = 0.1 if prefetch else 15.0
+    fetch_lock = await acquire_user_fetch_lock(user_id, timeout=timeout)
+    if not fetch_lock:
+        logger.info(f"[FETCH-ONLY] User {user_id} fetch already in progress (prefetch={prefetch})")
+        return JSONResponse(content={"fetched": 0, "skipped": 0, "status": "already_fetching"})
+
+    try:
+        from gmail import fetch_only_pipeline
+
+        final_event = {"fetched": 0, "skipped": 0}
+        async for event in fetch_only_pipeline(limit=limit, user_id=user_id):
+            final_event = event
+
+        return JSONResponse(content=final_event)
+    finally:
+        release_user_fetch_lock(fetch_lock)
 
 
 @app.post("/emails/label-only")

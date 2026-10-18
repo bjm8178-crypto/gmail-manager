@@ -35,6 +35,12 @@ export function AnalysisProvider({ children }) {
   const readerRef = useRef(null);
   const abortRef = useRef(null);
 
+  // Background pre-fetch coordination
+  const isPrefetchingRef = useRef(false);
+  const activePrefetchPromiseRef = useRef(null);
+  const isAnalyzingRef = useRef(isAnalyzing);
+  isAnalyzingRef.current = isAnalyzing;
+
   // Cleanup on unmount
   useEffect(() => {
     return () => {
@@ -45,6 +51,37 @@ export function AnalysisProvider({ children }) {
         try { abortRef.current.abort(); } catch { /* ignore */ }
       }
     };
+  }, []);
+
+  const prefetchEmails = useCallback(async (limit = 25) => {
+    // If active analysis or another prefetch is already running, skip quietly
+    if (isAnalyzingRef.current || isPrefetchingRef.current) {
+      return;
+    }
+
+    isPrefetchingRef.current = true;
+    const controller = new AbortController();
+
+    const task = (async () => {
+      try {
+        const res = await apiRequest(`/emails/fetch-only?limit=${limit}&prefetch=true`, {
+          method: 'POST',
+          signal: controller.signal,
+        });
+        if (res.ok) {
+          const data = await res.json();
+          return data;
+        }
+      } catch {
+        // Silently catch - prefetch should never disrupt the UI
+      } finally {
+        isPrefetchingRef.current = false;
+        activePrefetchPromiseRef.current = null;
+      }
+    })();
+
+    activePrefetchPromiseRef.current = task;
+    return task;
   }, []);
 
   const startAnalysis = useCallback(async (limit) => {
@@ -63,6 +100,18 @@ export function AnalysisProvider({ children }) {
     abortRef.current = controller;
 
     try {
+      // CONCURRENCY SHIELD:
+      // If a background prefetch is actively in-flight, await its completion
+      // instead of issuing a duplicate request or conflicting with it!
+      if (isPrefetchingRef.current && activePrefetchPromiseRef.current) {
+        setCurrentEmail('Finalizing email download...');
+        try {
+          await activePrefetchPromiseRef.current;
+        } catch {
+          // If prefetch failed, normal fetch below will handle it
+        }
+      }
+
       setCurrentEmail('Fetching emails from Gmail...');
 
       const fetchResponse = await apiRequest(`/emails/fetch-only?limit=${limit}`, {
@@ -136,6 +185,7 @@ export function AnalysisProvider({ children }) {
     error,
     currentEmail,
     startAnalysis,
+    prefetchEmails,
     clearStats,
     clearError,
   };
