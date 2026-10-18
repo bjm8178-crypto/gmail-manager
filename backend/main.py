@@ -609,6 +609,9 @@ async def emails_get(request: Request, user: dict = Depends(require_auth)):
         include_body = os.getenv("EMAILS_LIST_INCLUDE_BODY", "0") == "1"
         emails = await asyncio.to_thread(get_analyzed_emails, user_id, include_body=include_body)
         logger.info(f"[EMAILS-GET] Found {len(emails)} emails")
+        if any(not e.get("received_at") for e in emails):
+            from gmail import backfill_missing_received_at
+            asyncio.create_task(backfill_missing_received_at(user_id, _request_user_email(request)))
         return {"emails": emails, "count": len(emails)}
     except Exception as e:
         logger.error(f"[EMAILS-GET ERROR] {type(e).__name__}: {str(e)}", exc_info=True)
@@ -1678,11 +1681,21 @@ async def email_get_body(email_id: str, request: Request, user: dict = Depends(r
             content={"error": "Email not found"},
             headers={"Cache-Control": "private, no-store"},
         )
+    received_at = email_data.get("received_at")
+    if not received_at:
+        try:
+            from gmail import get_single_email_received_at
+            user_email = user.get("email") or _request_user_email(request)
+            received_at = await asyncio.to_thread(get_single_email_received_at, user_id, user_email, email_id)
+        except Exception as e:
+            logger.debug(f"[EMAIL-BODY] Could not backfill received_at for {email_id}: {e}")
+
     return JSONResponse(
         content={
             "email_id": email_data["email_id"],
             "body": email_data.get("body", "") or "",
             "snippet": email_data.get("snippet", "") or "",
+            "received_at": received_at or email_data.get("received_at"),
         },
         headers={"Cache-Control": "private, no-store"},
     )

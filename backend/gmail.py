@@ -247,12 +247,22 @@ def _parse_email_metadata(email_id: str, msg: dict) -> dict:
     batch-fetch code paths so parsing logic stays in one place.
     Body is left empty - fetched on-demand via _get_email_body().
     """
+    import email.utils
     from datetime import datetime, timezone
     headers = {h["name"].lower(): h["value"] for h in msg.get("payload", {}).get("headers", [])}
+    received_at = None
     try:
-        received_at = datetime.fromtimestamp(int(msg["internalDate"]) / 1000, tz=timezone.utc).isoformat()
+        if "internalDate" in msg and msg["internalDate"]:
+            received_at = datetime.fromtimestamp(int(msg["internalDate"]) / 1000, tz=timezone.utc).isoformat()
     except (KeyError, TypeError, ValueError, OverflowError, OSError):
         received_at = None
+
+    if not received_at and headers.get("date"):
+        try:
+            dt = email.utils.parsedate_to_datetime(headers["date"])
+            received_at = dt.astimezone(timezone.utc).isoformat()
+        except Exception:
+            pass
 
     return {
         "id": email_id,
@@ -1939,6 +1949,8 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
             # Phase 1 Task 4: Enable transactional retry queue removal for success writes
             remove_retry = values.get('status') == 'labeled'
             if update_mode:
+                if values.get("received_at") is None:
+                    values.pop("received_at", None)
                 if db_writer is not None:
                     row = dict(values)
                     row["email_id"] = email_id
@@ -2374,6 +2386,7 @@ async def fetch_only_pipeline(limit: int = 50, user_id: int = None, user_email: 
                     "sender": email.get("sender", ""),
                     "subject": email.get("subject", ""),
                     "body": b,
+                    "received_at": email.get("received_at"),
                 })
 
             try:
@@ -2397,6 +2410,7 @@ async def fetch_only_pipeline(limit: int = 50, user_id: int = None, user_email: 
                             subject=r["subject"],
                             status='fetched',
                             body=r["body"],
+                            received_at=r.get("received_at"),
                         )
                         saved += 1
                     except Exception:
@@ -2433,6 +2447,7 @@ async def fetch_only_pipeline(limit: int = 50, user_id: int = None, user_email: 
                     subject=email.get("subject", ""),
                     status='fetched',
                     body=body,
+                    received_at=email.get("received_at"),
                 )
                 saved_count += 1
                 yield {"type": "progress", "current": saved_count, "total": len(new_emails)}
@@ -2597,4 +2612,80 @@ async def label_only_pipeline(limit: int = None, user_id: int = None, user_email
         print(summary_msg)
 
         yield {"type": "complete", "analyzed": analyzed_count, "failed": failed_count, "results": results}
+
+
+def get_single_email_received_at(user_id: int, user_email: str | None, email_id: str) -> str | None:
+    """
+    Fetch received_at for a single email from Gmail and persist it to the DB if found.
+    Used on-demand by GET /emails/{email_id}/body when received_at is missing.
+    """
+    if not user_email and user_id is not None:
+        try:
+            user_email = get_user_email_by_id(user_id)
+        except Exception:
+            pass
+    if not user_email:
+        return None
+
+    try:
+        service = get_gmail_service(user_email)
+        if not service:
+            return None
+        details = _get_email_details(service, email_id)
+        if details and details.get("received_at"):
+            received_at = details["received_at"]
+            from database import update_email_received_at
+            update_email_received_at(user_id, email_id, received_at)
+            return received_at
+    except Exception as e:
+        logger.debug(f"[GMAIL] Failed to get received_at for email {email_id}: {e}")
+    return None
+
+
+_backfill_in_progress = set()
+
+
+async def backfill_missing_received_at(user_id: int, user_email: str | None = None) -> int:
+    """
+    Backfill missing received_at timestamps for emails in the database using Gmail API metadata batches.
+    Runs in the background without blocking the event loop.
+    """
+    if user_id in _backfill_in_progress:
+        return 0
+    _backfill_in_progress.add(user_id)
+    try:
+        from database import get_emails_missing_received_at, update_received_at_batch
+        missing_ids = await asyncio.to_thread(get_emails_missing_received_at, user_id, 200)
+        if not missing_ids:
+            return 0
+
+        if not user_email:
+            user_email = await asyncio.to_thread(get_user_email_by_id, user_id)
+        if not user_email:
+            return 0
+
+        logger.info(f"[BACKFILL] Found {len(missing_ids)} emails missing received_at for user {user_id}. Backfilling...")
+        details = await asyncio.to_thread(
+            _fetch_email_details,
+            missing_ids,
+            user_id=user_id,
+            user_email=user_email,
+        )
+
+        updates = [
+            (d["received_at"], d["id"])
+            for d in details
+            if d.get("received_at") and d.get("id")
+        ]
+        if updates:
+            updated_count = await asyncio.to_thread(update_received_at_batch, user_id, updates)
+            logger.info(f"[BACKFILL] Successfully updated received_at for {updated_count} emails for user {user_id}")
+            return updated_count
+        return 0
+    except Exception as e:
+        logger.warning(f"[BACKFILL] Error backfilling received_at for user {user_id}: {e}")
+        return 0
+    finally:
+        _backfill_in_progress.discard(user_id)
+
 

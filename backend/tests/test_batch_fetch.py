@@ -149,6 +149,7 @@ class TestBatchFetch:
                     "sender": "existing@test.com",
                     "subject": "Existing subject",
                     "body": "Attempted overwrite body",
+                    "received_at": "2026-10-11T02:57:00+00:00",
                 },
                 {
                     "email_id": "new_fetched_456",
@@ -156,6 +157,7 @@ class TestBatchFetch:
                     "sender": "new@test.com",
                     "subject": "New subject",
                     "body": "New body",
+                    "received_at": "2026-10-11T02:57:00+00:00",
                 },
             ]
 
@@ -167,12 +169,15 @@ class TestBatchFetch:
             assert existing["status"] == "labeled"
             assert existing["scam_score"] == 50
             assert existing["snippet"] == "Existing snippet"
+            # Verify received_at was safely backfilled on conflict without downgrade
+            assert existing["received_at"] == "2026-10-11T02:57:00+00:00"
 
-            # Check new row was inserted as 'fetched'
+            # Check new row was inserted as 'fetched' with received_at
             new_row = all_emails["new_fetched_456"]
             assert new_row["status"] == "fetched"
             assert new_row["scam_score"] is None
             assert new_row["snippet"] == "New snippet"
+            assert new_row["received_at"] == "2026-10-11T02:57:00+00:00"
         finally:
             conn = db._get_connection()
             try:

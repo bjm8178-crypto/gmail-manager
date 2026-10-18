@@ -34,8 +34,10 @@ function EmailDetailModal({ email, senderName, senderEmail, decodedSubject, indi
 
   const [fetchedBody, setFetchedBody] = useState(email?.body || null);
   const [loadingBody, setLoadingBody] = useState(!email?.body && Boolean(email?.email_id || email?.id));
+  const [receivedAt, setReceivedAt] = useState(email?.received_at || email?.date || null);
 
   useEffect(() => {
+    setReceivedAt(email?.received_at || email?.date || null);
     if (email?.body) {
       setFetchedBody(email.body);
       setLoadingBody(false);
@@ -52,8 +54,13 @@ function EmailDetailModal({ email, senderName, senderEmail, decodedSubject, indi
         const res = await apiRequest(`/emails/${encodeURIComponent(emailId)}/body`);
         if (res.ok) {
           const data = await res.json();
-          if (isMounted && data?.body) {
-            setFetchedBody(data.body);
+          if (isMounted) {
+            if (data?.body) {
+              setFetchedBody(data.body);
+            }
+            if (data?.received_at) {
+              setReceivedAt(data.received_at);
+            }
           }
         }
       } catch (err) {
@@ -70,7 +77,7 @@ function EmailDetailModal({ email, senderName, senderEmail, decodedSubject, indi
     return () => {
       isMounted = false;
     };
-  }, [email?.email_id, email?.id, email?.body]);
+  }, [email?.email_id, email?.id, email?.body, email?.received_at, email?.date]);
 
   const dialogRef = useModalFocus(onClose);
 
@@ -139,6 +146,8 @@ function EmailDetailModal({ email, senderName, senderEmail, decodedSubject, indi
   const formatDate = (dateStr) => {
     if (!dateStr) return 'Unknown';
     const date = new Date(dateStr);
+    if (isNaN(date.getTime())) return 'Unknown';
+
     const now = new Date();
     const diffMs = now - date;
     const diffMins = Math.floor(diffMs / 60000);
@@ -146,17 +155,39 @@ function EmailDetailModal({ email, senderName, senderEmail, decodedSubject, indi
     const diffDays = Math.floor(diffMs / 86400000);
 
     let timeAgo = '';
-    if (diffMins < 60) timeAgo = `${diffMins} min ago`;
-    else if (diffHours < 24) timeAgo = `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
-    else if (diffDays < 7) timeAgo = `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
+    if (diffMs < 0 || diffMins < 1) {
+      timeAgo = 'just now';
+    } else if (diffMins === 1) {
+      timeAgo = '1 minute ago';
+    } else if (diffMins < 60) {
+      timeAgo = `${diffMins} minutes ago`;
+    } else if (diffHours === 1) {
+      timeAgo = '1 hour ago';
+    } else if (diffHours < 24) {
+      timeAgo = `${diffHours} hours ago`;
+    } else if (diffDays === 1) {
+      timeAgo = '1 day ago';
+    } else if (diffDays < 30) {
+      timeAgo = `${diffDays} days ago`;
+    } else if (diffDays < 365) {
+      const months = Math.floor(diffDays / 30);
+      timeAgo = `${months} month${months > 1 ? 's' : ''} ago`;
+    } else {
+      const years = Math.floor(diffDays / 365);
+      timeAgo = `${years} year${years > 1 ? 's' : ''} ago`;
+    }
 
-    const formatted = date.toLocaleDateString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric'
-    });
+    const isSameYear = date.getFullYear() === now.getFullYear();
+    const weekday = date.toLocaleDateString('en-US', { weekday: 'short' });
+    const month = date.toLocaleDateString('en-US', { month: 'short' });
+    const day = date.getDate();
+    const time = date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
 
-    return timeAgo ? `${timeAgo}, ${formatted}` : formatted;
+    const formattedDate = isSameYear
+      ? `${weekday}, ${month} ${day}, ${time}`
+      : `${weekday}, ${month} ${day}, ${date.getFullYear()}, ${time}`;
+
+    return timeAgo ? `${formattedDate} (${timeAgo})` : formattedDate;
   };
 
   const senderTrust = { level: 'unknown', label: 'Sender identity not verified', color: 'var(--color-text-secondary)' };
@@ -247,7 +278,7 @@ function EmailDetailModal({ email, senderName, senderEmail, decodedSubject, indi
                 </p>
 
                 <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
-                  {formatDate(email.received_at || email.date || email.analyzed_at)}
+                  {formatDate(receivedAt || email.received_at || email.date || email.analyzed_at)}
                 </span>
               </div>
             </div>

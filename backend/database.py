@@ -970,7 +970,7 @@ def update_analyzed_emails_bulk(user_id: int, rows: list[dict]) -> int:
                 url_scan_status = v.url_scan_status,
                 urls_total = v.urls_total,
                 urls_checked = v.urls_checked,
-                received_at = v.received_at,
+                received_at = COALESCE(NULLIF(v.received_at, ''), a.received_at),
                 attachment_risk = v.attachment_risk,
                 attachment_details = v.attachment_details
             FROM (VALUES %s) AS v(
@@ -1162,17 +1162,18 @@ def save_fetched_emails_bulk(user_id: int, rows: list[dict]):
             values = [
                 (r['email_id'], user_id, None, None, '[]', 0,
                  r.get('snippet', ''), r.get('sender', ''), r.get('subject', ''),
-                 'fetched', r.get('body', ''))
+                 'fetched', r.get('body', ''), r.get('received_at'))
                 for r in chunk
             ]
             execute_values(cursor, """
                 INSERT INTO analyzed_emails
                     (email_id, user_id, label_id, scam_score, scam_indicators,
-                     is_quarantined, snippet, sender, subject, status, body)
+                     is_quarantined, snippet, sender, subject, status, body, received_at)
                 VALUES %s
-                ON CONFLICT (email_id) DO NOTHING
+                ON CONFLICT (email_id) DO UPDATE SET
+                    received_at = COALESCE(NULLIF(analyzed_emails.received_at, ''), EXCLUDED.received_at)
             """, values,
-            template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
+            template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
             conn.commit()
     except Exception:
         conn.rollback()
@@ -1226,14 +1227,14 @@ def get_analyzed_emails(user_id: int, limit: int = None, include_body: bool = Tr
 
 
 def get_email_body(user_id: int, email_id: str) -> dict | None:
-    """Return email_id, body, and snippet for a specific user-owned email."""
+    """Return email_id, body, snippet, and received_at for a specific user-owned email."""
     conn = _get_connection()
     try:
         cursor = conn.cursor()
         _execute(
             cursor,
             """
-            SELECT email_id, body, snippet
+            SELECT email_id, body, snippet, received_at
             FROM analyzed_emails
             WHERE email_id = %s AND user_id = %s
             """,
@@ -1243,6 +1244,88 @@ def get_email_body(user_id: int, email_id: str) -> dict | None:
         if not row:
             return None
         return dict(row)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _release_connection(conn)
+
+
+def get_emails_missing_received_at(user_id: int, limit: int = 150) -> list[str]:
+    """Return email_ids that have no received_at timestamp for backfill."""
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        _execute(
+            cursor,
+            """
+            SELECT email_id
+            FROM analyzed_emails
+            WHERE user_id = %s AND (received_at IS NULL OR received_at = '')
+            ORDER BY analyzed_at DESC
+            LIMIT %s
+            """,
+            (user_id, limit),
+        )
+        rows = cursor.fetchall()
+        return [row["email_id"] if isinstance(row, dict) else row[0] for row in rows]
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _release_connection(conn)
+
+
+def update_email_received_at(user_id: int, email_id: str, received_at: str) -> bool:
+    """Update received_at for a single email if owned by user."""
+    if not received_at:
+        return False
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        _execute(
+            cursor,
+            """
+            UPDATE analyzed_emails
+            SET received_at = %s
+            WHERE email_id = %s AND user_id = %s
+            """,
+            (received_at, email_id, user_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _release_connection(conn)
+
+
+def update_received_at_batch(user_id: int, updates: list[tuple[str, str]]) -> int:
+    """
+    Bulk update received_at for a list of (received_at, email_id) tuples.
+    Returns the number of rows updated.
+    """
+    if not updates:
+        return 0
+    from psycopg2.extras import execute_values
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        execute_values(
+            cursor,
+            """
+            UPDATE analyzed_emails AS ae
+            SET received_at = v.received_at
+            FROM (VALUES %s) AS v(received_at, email_id)
+            WHERE ae.email_id = v.email_id AND ae.user_id = %s
+            """,
+            updates,
+            template="(%s, %s)",
+        )
+        count = cursor.rowcount
+        conn.commit()
+        return count
     except Exception:
         conn.rollback()
         raise

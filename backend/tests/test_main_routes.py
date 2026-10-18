@@ -327,7 +327,7 @@ def test_email_get_body_endpoint_owner_success():
     client = TestClient(app)
 
     try:
-        with patch('main.get_email_body', return_value={"email_id": "e123", "body": "Important text", "snippet": "Important..."}):
+        with patch('main.get_email_body', return_value={"email_id": "e123", "body": "Important text", "snippet": "Important...", "received_at": "2026-10-11T02:57:00+00:00"}):
             response = client.get("/emails/e123/body")
             assert response.status_code == 200
             assert response.headers.get("Cache-Control") == "private, no-store"
@@ -335,6 +335,7 @@ def test_email_get_body_endpoint_owner_success():
             assert data["email_id"] == "e123"
             assert data["body"] == "Important text"
             assert data["snippet"] == "Important..."
+            assert data["received_at"] == "2026-10-11T02:57:00+00:00"
     finally:
         app.dependency_overrides.clear()
 
