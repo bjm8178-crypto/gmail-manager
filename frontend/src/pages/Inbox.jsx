@@ -18,6 +18,7 @@ import { useAnalysis } from '../context/AnalysisContext';
 import { apiGet, apiPost, apiDelete, apiRequest } from '../lib/api';
 import { usePagination } from '../hooks/usePagination';
 import Pagination from '../components/Pagination';
+import { ChevronLeft, ChevronRight } from 'lucide-react';
 
 const SORT_OPTIONS = [
   { value: 'newest', label: 'Newest First' },
@@ -39,7 +40,7 @@ function Inbox() {
   const [availableLabels, setAvailableLabels] = useState(['All']);
   const [labelObjects, setLabelObjects] = useState([]);
 
-  // Pagination with usePagination hook (50 emails per page)
+  // Pagination with usePagination hook (10 emails per page)
   const {
     currentData: paginatedEmails,
     currentPage,
@@ -54,7 +55,29 @@ function Inbox() {
     totalItems,
     itemsPerPage,
     resetPagination,
-  } = usePagination(emails, 50);
+  } = usePagination(emails, 10);
+
+  // Page navigation handlers with smooth scroll to top
+  const handlePageChange = (page) => {
+    goToPage(page);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+  const handleNextPage = () => {
+    nextPage();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+  const handlePrevPage = () => {
+    prevPage();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+  const handleFirstPage = () => {
+    goToFirstPage();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+  const handleLastPage = () => {
+    goToLastPage();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
 
   // Pending label changes (Phase 36/38/43)
   const [pendingLabelChanges, setPendingLabelChanges] = useState({});
@@ -938,12 +961,47 @@ function Inbox() {
           </div>
         )}
 
-        {/* Result Count & Pagination Info */}
+        {/* Result Count & Quick Pagination */}
         {!loading && emails.length > 0 && (
-          <div className="flex items-center justify-between mb-3">
-            <p className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+          <div className="flex items-center justify-between mb-3 px-1">
+            <p className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
               Showing {(currentPage - 1) * itemsPerPage + 1}-{Math.min(currentPage * itemsPerPage, emails.length)} of {emails.length} emails
             </p>
+            {totalPages > 1 && (
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs mr-1 font-medium" style={{ color: 'var(--color-text-muted)' }}>
+                  Page {currentPage} of {totalPages}
+                </span>
+                <button
+                  onClick={handlePrevPage}
+                  disabled={!hasPrevPage}
+                  className="w-7 h-7 flex items-center justify-center rounded-lg border disabled:opacity-30 disabled:cursor-not-allowed transition-all hover:opacity-80 active:scale-95"
+                  style={{
+                    backgroundColor: 'var(--color-surface)',
+                    borderColor: 'var(--color-border)',
+                    color: 'var(--color-text-primary)',
+                  }}
+                  aria-label="Previous page"
+                  title="Previous page"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={handleNextPage}
+                  disabled={!hasNextPage}
+                  className="w-7 h-7 flex items-center justify-center rounded-lg border disabled:opacity-30 disabled:cursor-not-allowed transition-all hover:opacity-80 active:scale-95"
+                  style={{
+                    backgroundColor: 'var(--color-surface)',
+                    borderColor: 'var(--color-border)',
+                    color: 'var(--color-text-primary)',
+                  }}
+                  aria-label="Next page"
+                  title="Next page"
+                >
+                  <ChevronRight className="w-4 h-4" />
+                </button>
+              </div>
+            )}
           </div>
         )}
 
@@ -1020,11 +1078,11 @@ function Inbox() {
               totalPages={totalPages}
               hasNextPage={hasNextPage}
               hasPrevPage={hasPrevPage}
-              onPageChange={goToPage}
-              onNextPage={nextPage}
-              onPrevPage={prevPage}
-              onFirstPage={goToFirstPage}
-              onLastPage={goToLastPage}
+              onPageChange={handlePageChange}
+              onNextPage={handleNextPage}
+              onPrevPage={handlePrevPage}
+              onFirstPage={handleFirstPage}
+              onLastPage={handleLastPage}
               totalItems={emails.length}
               itemsPerPage={itemsPerPage}
             />
