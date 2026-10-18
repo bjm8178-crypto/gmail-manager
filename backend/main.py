@@ -367,7 +367,7 @@ async def auth_callback(request: Request):
         verifier = consume_oauth_state(request.query_params.get("state"), request.session)
         if not verifier:
             return JSONResponse(status_code=400, content={"error": "Invalid or expired OAuth state. Restart login."})
-        result = handle_callback(code, code_verifier=verifier)
+        result = await asyncio.to_thread(handle_callback, code, code_verifier=verifier)
         logger.info(f"[AUTH CALLBACK] handle_callback result: {result}")
         
         # Store user_id and gmail_address in session (for backward compatibility)
@@ -489,7 +489,7 @@ async def auth_status(request: Request):
         logger.info("[AUTH/STATUS] JWT authentication successful")
         
         # Verify the Gmail token is still valid
-        logged_in = is_logged_in(user_email)
+        logged_in = await asyncio.to_thread(is_logged_in, user_email)
         
         if logged_in:
             response_data = {
@@ -507,16 +507,16 @@ async def auth_status(request: Request):
         
         if user_email:
             # User has active session, check if token is valid
-            logged_in = is_logged_in(user_email)
+            logged_in = await asyncio.to_thread(is_logged_in, user_email)
             logger.info(f"[AUTH/STATUS] Stored token valid: {logged_in}")
         else:
             # No session, check stored token for the session user
-            logged_in = is_logged_in(user_email)
+            logged_in = await asyncio.to_thread(is_logged_in, user_email)
             logger.info(f"[AUTH/STATUS DEBUG] Token check: {logged_in}")
         
         response_data = {"logged_in": logged_in}
         if logged_in:
-            email = user_email or get_user_email(user_email)
+            email = user_email or (await asyncio.to_thread(get_user_email, user_email))
             if email:
                 response_data["email"] = email
     
@@ -557,7 +557,7 @@ async def auth_logout(request: Request):
     if user_email:
         try:
             from auth import delete_token as delete_user_token
-            delete_user_token(user_email)
+            await asyncio.to_thread(delete_user_token, user_email)
             logger.info(f"[AUTH] Deleted user-specific token for {user_email}")
         except Exception as e:
             logger.info(f"[AUTH] Error deleting user token: {e}")

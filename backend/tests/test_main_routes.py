@@ -357,3 +357,68 @@ def test_email_get_body_endpoint_not_found_or_other_user():
     finally:
         app.dependency_overrides.clear()
 
+
+@pytest.mark.asyncio
+async def test_auth_status_does_not_block_event_loop_during_token_refresh():
+    """
+    Test that auth_status offloads sync token loading and refresh to a worker thread
+    via asyncio.to_thread, ensuring concurrent event loop tasks (e.g. 50ms ticker)
+    are not blocked when refresh() takes 0.5s.
+    """
+    import asyncio
+    import json
+    import time
+    from unittest.mock import patch, MagicMock
+    from starlette.requests import Request
+    from main import auth_status
+
+    tick_intervals = []
+    stop_ticker = False
+
+    async def ticker():
+        last = time.perf_counter()
+        while not stop_ticker:
+            await asyncio.sleep(0.05)
+            now = time.perf_counter()
+            tick_intervals.append(now - last)
+            last = now
+
+    def fake_refresh(request):
+        time.sleep(0.5)
+
+    fake_creds = MagicMock()
+    fake_creds.expired = True
+    fake_creds.refresh_token = "refresh_token_123"
+    fake_creds.valid = True
+    fake_creds.refresh.side_effect = fake_refresh
+    fake_creds.to_json.return_value = json.dumps({"token": "new_token"})
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/auth/status",
+        "headers": [],
+        "session": {},
+        "cookies": {},
+    }
+    req = Request(scope)
+
+    ticker_task = asyncio.create_task(ticker())
+    await asyncio.sleep(0.01)  # Yield to event loop so ticker starts before auth_status
+
+    with patch("main.get_user_from_token", return_value={"user_id": 1, "email": "test@example.com"}), \
+         patch("auth.get_user_token", return_value=json.dumps({"token": "old_token"})), \
+         patch("auth.Credentials.from_authorized_user_info", return_value=fake_creds), \
+         patch("auth.save_user_token", return_value=None):
+        resp = await auth_status(req)
+
+    stop_ticker = True
+    await ticker_task
+
+    max_gap = max(tick_intervals) if tick_intervals else 0.0
+    assert max_gap < 0.2, f"Event loop was blocked! Max ticker gap was {max_gap:.3f}s (must be < 0.2s)"
+    data = json.loads(resp.body) if hasattr(resp, "body") else resp
+    assert data["logged_in"] is True
+    assert fake_creds.refresh.called
+
+
