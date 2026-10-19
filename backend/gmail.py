@@ -1349,7 +1349,7 @@ async def _fetch_new_emails(limit: int, user_id: int, user_email: str):
     new_emails = []
     skipped_count = 0
     page_token = None
-    page_size = min(50, max(limit * 2, 10))
+    page_size = min(250, max(limit * 2, 100))
 
     while len(new_emails) < limit:
         ids, next_page_token = await asyncio.wait_for(

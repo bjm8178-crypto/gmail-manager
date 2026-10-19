@@ -786,10 +786,23 @@ async def emails_fetch_only(request: Request, user: dict = Depends(require_auth)
         return JSONResponse(content={"fetched": 0, "skipped": 0, "status": "already_fetching"})
 
     try:
+        from database import get_emails_by_status
+        if not prefetch:
+            existing_fetched = await asyncio.to_thread(get_emails_by_status, user_id, 'fetched', limit)
+            if len(existing_fetched) >= limit:
+                logger.info(
+                    f"[FETCH-ONLY] User {user_id} already has {len(existing_fetched)} staged emails "
+                    f"(limit={limit}). Skipping Gmail network fetch!"
+                )
+                return JSONResponse(content={"fetched": len(existing_fetched), "skipped": 0, "staged": True})
+            needed_from_gmail = limit - len(existing_fetched)
+        else:
+            needed_from_gmail = limit
+
         from gmail import fetch_only_pipeline
 
         final_event = {"fetched": 0, "skipped": 0}
-        async for event in fetch_only_pipeline(limit=limit, user_id=user_id):
+        async for event in fetch_only_pipeline(limit=needed_from_gmail, user_id=user_id):
             final_event = event
 
         # Auto-trigger background preanalyzer if prefetch
