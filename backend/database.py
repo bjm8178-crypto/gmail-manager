@@ -1044,7 +1044,7 @@ def get_emails_by_status(user_id: int, status: str, limit: int = None) -> list[d
 
         query = """SELECT * FROM analyzed_emails
                    WHERE user_id = %s AND status = %s
-                   ORDER BY COALESCE(NULLIF(received_at, ''), CAST(analyzed_at AS TEXT)) DESC"""
+                   ORDER BY (CASE WHEN analysis_status = 'pre_analyzed' THEN 0 ELSE 1 END), COALESCE(NULLIF(received_at, ''), CAST(analyzed_at AS TEXT)) DESC"""
         params = (user_id, status)
         if limit is not None:
             query += " LIMIT %s"

@@ -789,13 +789,13 @@ async def emails_fetch_only(request: Request, user: dict = Depends(require_auth)
         from database import get_emails_by_status
         if not prefetch:
             existing_fetched = await asyncio.to_thread(get_emails_by_status, user_id, 'fetched', limit)
-            if len(existing_fetched) >= limit:
+            if len(existing_fetched) > 0:
                 logger.info(
-                    f"[FETCH-ONLY] User {user_id} already has {len(existing_fetched)} staged emails "
-                    f"(limit={limit}). Skipping Gmail network fetch!"
+                    f"[FETCH-ONLY] User {user_id} has {len(existing_fetched)} staged/prefetched emails. "
+                    f"Using stored emails immediately without waiting on Gmail!"
                 )
-                return JSONResponse(content={"fetched": len(existing_fetched), "skipped": 0, "staged": True})
-            needed_from_gmail = limit - len(existing_fetched)
+                return JSONResponse(content={"fetched": min(len(existing_fetched), limit), "skipped": 0, "staged": True})
+            needed_from_gmail = limit
         else:
             needed_from_gmail = limit
 
@@ -857,6 +857,27 @@ async def emails_label_only(request: Request, user: dict = Depends(require_auth)
         await clear_user_inflight_emails(user_id)
         release_user_job_lock(job_lock)
         logger.info(f"[JOB_LOCK] Released label-only lock for user {user_id}")
+
+        # Replenish prefetch pool in background so user has emails ready for next analysis
+        async def _replenish_pool(uid: int):
+            try:
+                flock = await acquire_user_fetch_lock(uid, timeout=0.1)
+                if not flock:
+                    return
+                try:
+                    from gmail import fetch_only_pipeline
+                    from background_preanalyzer import run_background_preanalyzer
+                    logger.info(f"[REPLENISH] Background fetching fresh emails for user {uid}...")
+                    async for _ in fetch_only_pipeline(limit=50, user_id=uid):
+                        pass
+                    logger.info(f"[REPLENISH] Launching background preanalyzer for user {uid}...")
+                    await run_background_preanalyzer(uid)
+                finally:
+                    release_user_fetch_lock(flock)
+            except Exception as replenish_err:
+                logger.warning(f"[REPLENISH] Background replenishment error: {replenish_err}")
+
+        asyncio.create_task(_replenish_pool(user_id))
 
 
 @app.post("/emails/preanalyze")

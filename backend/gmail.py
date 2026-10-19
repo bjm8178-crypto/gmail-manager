@@ -1942,6 +1942,7 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
         snippet = email.get("snippet", "")
         received_at = email.get("received_at")
         url_threat_confirmed = False
+        url_scan_unavailable = False
         urls_total = urls_checked = 0
         url_scan_status = "unavailable"
 
@@ -2019,6 +2020,11 @@ async def _analyze_one(email: dict, semaphore: asyncio.Semaphore,
                     urls_total = email.get("urls_total") or 0
                     urls_checked = email.get("urls_checked") or 0
                     url_threat_confirmed = (url_scan_status == "threat_detected")
+                    url_scan_unavailable = (url_scan_status in ("unavailable", "partial"))
+                if email.get("url_threat_confirmed") is not None:
+                    url_threat_confirmed = bool(email.get("url_threat_confirmed"))
+                if email.get("url_scan_unavailable") is not None:
+                    url_scan_unavailable = bool(email.get("url_scan_unavailable"))
 
             async def run_ai_cascade():
                 nonlocal precomputed_ai_result
