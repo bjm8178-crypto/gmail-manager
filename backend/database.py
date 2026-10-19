@@ -1599,10 +1599,15 @@ def update_received_at_batch(user_id: int, updates: list[tuple[str, str]]) -> in
 # ---------- URL CACHE ----------
 
 def save_url_result(email_id: str, url: str, is_safe: int, threat_type: str) -> None:
-    """Insert one URL result, ignore if same email_id + url already exists."""
+    """Insert one URL result, ignore if same email_id + url already exists or email is in staging table."""
     conn = _get_connection()
     try:
         cursor = conn.cursor()
+
+        # Check if email exists in analyzed_emails to prevent FK violation while staged in prefetched_emails
+        _execute(cursor, "SELECT 1 FROM analyzed_emails WHERE email_id = %s", (email_id,))
+        if cursor.fetchone() is None:
+            return
 
         # Check for existing entry with same email_id + url
         _execute(cursor,
@@ -1617,9 +1622,9 @@ def save_url_result(email_id: str, url: str, is_safe: int, threat_type: str) -> 
             (email_id, url, is_safe, threat_type),
         )
         conn.commit()
-    except Exception:
+    except Exception as e:
         conn.rollback()
-        raise
+        logger.debug(f"[URL-CACHE] Could not cache URL to DB: {e}")
     finally:
         _release_connection(conn)
 

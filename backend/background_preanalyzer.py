@@ -308,23 +308,35 @@ async def _worker_loop(
             queue.task_done()
 
         except Exception as err:
-            logger.warning(
-                f"[PREANALYZER Worker {worker_idx}] Failed {email_id[:12]}: {err}. "
-                f"Re-queueing to tail of the list..."
-            )
-            retries = email.get("_retries", 0)
-            if retries < 3:
-                email["_retries"] = retries + 1
-                # Put back to the TAIL of the queue
+            err_str = str(err).lower()
+            is_quota_error = any(kw in err_str for kw in ("429", "rate limit", "credits", "free-models-per-day"))
+            if is_quota_error:
+                logger.warning(
+                    f"[PREANALYZER Worker {worker_idx}] Key reached rate limit/quota: {err}. "
+                    f"Stopping worker {worker_idx} to avoid repeated errors."
+                )
+                # Put email back for any other active worker
                 await queue.put(email)
-            queue.task_done()
-            # Brief backoff if key was rate limited or network hiccuped
-            await asyncio.sleep(2.0)
+                queue.task_done()
+                break
+            else:
+                logger.warning(
+                    f"[PREANALYZER Worker {worker_idx}] Failed {email_id[:12]}: {err}. "
+                    f"Re-queueing to tail of the list..."
+                )
+                retries = email.get("_retries", 0)
+                if retries < 3:
+                    email["_retries"] = retries + 1
+                    # Put back to the TAIL of the queue
+                    await queue.put(email)
+                queue.task_done()
+                # Brief backoff if key was rate limited or network hiccuped
+                await asyncio.sleep(2.0)
 
 
 async def run_background_preanalyzer(user_id: int) -> int:
     """
-    Main entry point: Orchestrates the 20-worker dynamic pool.
+    Main entry point: Orchestrates the background preanalyzer worker pool.
     Pulls unpreanalyzed fetched emails, feeds them to the worker queue,
     and runs workers concurrently using dedicated OpenRouter keys.
     """
@@ -347,14 +359,15 @@ async def run_background_preanalyzer(user_id: int) -> int:
     available_label_names = [lbl["label_name"] for lbl in available_labels_list]
     label_id_by_name = {lbl["label_name"].casefold(): lbl["label_id"] for lbl in available_labels_list}
 
-    # Fetch unpreanalyzed emails from database (status='fetched', analysis_status!='pre_analyzed')
+    # Fetch unpreanalyzed emails from database (prefetched_emails table)
     unpreanalyzed = await asyncio.to_thread(get_unpreanalyzed_emails, user_id, limit=200)
     if not unpreanalyzed:
         logger.info(f"[PREANALYZER] No unpreanalyzed emails found for user {user_id}")
         return 0
 
     total_emails = len(unpreanalyzed)
-    num_workers = min(len(keys), 20)
+    # Cap workers to 4 so it stays safely within the database connection pool (max 8)
+    num_workers = min(len(keys), 4)
     logger.info(
         f"[PREANALYZER] Starting queue with {total_emails} emails using {num_workers} "
         f"concurrent workers (Keys loaded: {len(keys)})"
@@ -386,7 +399,22 @@ async def run_background_preanalyzer(user_id: int) -> int:
                     for i in range(num_workers)
                 ]
 
-                # Wait for queue to be fully processed
+                # Wait for queue to be fully processed, or all workers to stop (e.g. quota exhausted)
+                while not queue.empty():
+                    if all(t.done() for t in worker_tasks):
+                        logger.warning(
+                            f"[PREANALYZER] All workers stopped (daily quota exhausted). "
+                            f"Discarding remaining {queue.qsize()} queue items until quota reset."
+                        )
+                        while not queue.empty():
+                            try:
+                                queue.get_nowait()
+                                queue.task_done()
+                            except Exception:
+                                break
+                        break
+                    await asyncio.sleep(0.5)
+
                 await queue.join()
 
                 # Cancel worker loops
