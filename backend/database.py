@@ -83,10 +83,18 @@ def _release_connection(conn, close=False):
     """
     Release a database connection (back to pool for Postgres, close for SQLite).
     """
+    if conn is None:
+        return
     if USE_POSTGRES:
-        _pg_pool.putconn(conn, close=close)
+        try:
+            _pg_pool.putconn(conn, close=close)
+        except Exception as e:
+            logger.debug(f"[DB] Connection release note: {e}")
     else:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _execute(cursor, query, params=None):
@@ -936,6 +944,7 @@ def update_analyzed_email(email_id: str, label_id: int, scam_score: int,
                 p_dict = dict(p_row)
                 conn.commit()
                 _release_connection(conn)
+                conn = None
                 return save_analyzed_email(
                     email_id=email_id, user_id=user_id,
                     snippet=p_dict.get("snippet", ""),
@@ -943,7 +952,7 @@ def update_analyzed_email(email_id: str, label_id: int, scam_score: int,
                     subject=p_dict.get("subject", ""),
                     body=p_dict.get("body", ""),
                     received_at=p_dict.get("received_at"),
-                    remove_from_retry=remove_retry,
+                    remove_from_retry=remove_from_retry,
                     label_id=label_id, scam_score=scam_score,
                     scam_indicators=scam_indicators, is_quarantined=is_quarantined,
                     status=status, source=source, ml_confidence=ml_confidence,
@@ -972,10 +981,12 @@ def update_analyzed_email(email_id: str, label_id: int, scam_score: int,
         
         conn.commit()
     except Exception:
-        conn.rollback()
+        if conn is not None:
+            conn.rollback()
         raise
     finally:
-        _release_connection(conn)
+        if conn is not None:
+            _release_connection(conn)
 
 
 def update_analyzed_emails_bulk(user_id: int, rows: list[dict]) -> int:

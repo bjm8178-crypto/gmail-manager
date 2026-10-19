@@ -826,8 +826,8 @@ async def emails_label_only(request: Request, user: dict = Depends(require_auth)
     """
     user_id = user["user_id"]
 
-    # Phase 1 Task 2: Acquire job lock (fail fast with 409 if locked)
-    job_lock = await acquire_user_job_lock(user_id, timeout=0.1)
+    # Phase 1 Task 2: Acquire job lock (bounded wait to avoid transient 409)
+    job_lock = await acquire_user_job_lock(user_id, timeout=2.0)
     if not job_lock:
         return JSONResponse(
             status_code=409,

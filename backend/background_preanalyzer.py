@@ -25,6 +25,9 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 _pause_event = asyncio.Event()
 _pause_event.set()
 
+# Cooldown timestamp when OpenRouter daily quota is hit to avoid repeated errors
+_quota_exhausted_until = 0.0
+
 # Track running preanalyzer tasks per user: {user_id: asyncio.Task}
 _active_user_tasks: dict[int, asyncio.Task] = {}
 _tasks_lock = asyncio.Lock()
@@ -345,6 +348,11 @@ async def run_background_preanalyzer(user_id: int) -> int:
         logger.info("[PREANALYZER] No OPENROUTER_BACKGROUND_KEYS configured. Pre-analysis idle.")
         return 0
 
+    global _quota_exhausted_until
+    if time.monotonic() < _quota_exhausted_until:
+        logger.info("[PREANALYZER] OpenRouter daily quota cooldown active. Skipping background preanalyzer.")
+        return 0
+
     safebrowsing_key = get_background_safebrowsing_key()
 
     # Avoid duplicate concurrent preanalyzer tasks for the same user
@@ -406,6 +414,7 @@ async def run_background_preanalyzer(user_id: int) -> int:
                             f"[PREANALYZER] All workers stopped (daily quota exhausted). "
                             f"Discarding remaining {queue.qsize()} queue items until quota reset."
                         )
+                        _quota_exhausted_until = time.monotonic() + 1800
                         while not queue.empty():
                             try:
                                 queue.get_nowait()
