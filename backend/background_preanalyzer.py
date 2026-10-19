@@ -9,7 +9,7 @@ from ai_router import CLASSIFICATION_PROMPT, match_label
 from security import extract_urls, scan_urls_batch
 from database import (
     get_unpreanalyzed_emails,
-    update_analyzed_email,
+    update_prefetched_email,
     get_labels,
     get_label_id_by_name,
 )
@@ -282,23 +282,19 @@ async def _worker_loop(
 
             quarantined = int(should_quarantine(score, url_threat_confirmed, matched_label))
 
-            # Step 4: Persist to database
-            # Keep status='fetched' so it stays hidden from the inbox until user clicks Analyze!
+            # Step 4: Persist to prefetched_emails staging table
             await asyncio.to_thread(
-                update_analyzed_email,
+                update_prefetched_email,
                 email_id=email_id,
                 label_id=label_id,
                 scam_score=score,
                 scam_indicators=json.dumps(indicators),
                 is_quarantined=quarantined,
-                status="fetched",
-                source="openrouter",
                 provider_used=f"openrouter/{model_used}",
                 user_id=user_id,
                 reasoning=ai_data.get("reasoning", ""),
                 routing_decision="pre_analyzed",
                 analysis_status="pre_analyzed",
-                category_status="completed" if matched_label != "Unknown" else "unavailable",
                 url_scan_status=url_scan_status,
                 urls_total=urls_total,
                 urls_checked=urls_checked,

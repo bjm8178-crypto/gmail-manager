@@ -2438,21 +2438,17 @@ async def fetch_only_pipeline(limit: int = 50, user_id: int = None, user_email: 
                 return len(rows)
             except Exception as e:
                 logger.info(f"[FETCH-ONLY] Bulk save failed, falling back to per-email save: {e}")
+                from database import save_prefetched_email
                 saved = 0
                 for r in rows:
                     try:
                         await asyncio.to_thread(
-                            save_analyzed_email,
+                            save_prefetched_email,
                             email_id=r["email_id"],
                             user_id=user_id,
-                            label_id=None,
-                            scam_score=None,
-                            scam_indicators='[]',
-                            is_quarantined=0,
                             snippet=r["snippet"],
                             sender=r["sender"],
                             subject=r["subject"],
-                            status='fetched',
                             body=r["body"],
                             received_at=r.get("received_at"),
                         )

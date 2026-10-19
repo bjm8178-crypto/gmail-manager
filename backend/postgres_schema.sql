@@ -81,6 +81,35 @@ CREATE TABLE IF NOT EXISTS analyzed_emails (
     FOREIGN KEY (label_id) REFERENCES custom_labels(label_id) ON DELETE RESTRICT
 );
 
+-- TABLE 4b: prefetched_emails
+-- Dedicated staging buffer for prefetched and background pre-analyzed emails
+CREATE TABLE IF NOT EXISTS prefetched_emails (
+    email_id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    sender TEXT,
+    subject TEXT,
+    snippet TEXT,
+    body TEXT,
+    received_at TEXT,
+    analysis_status TEXT DEFAULT 'pending',
+    label_id INTEGER DEFAULT NULL,
+    scam_score INTEGER,
+    scam_indicators TEXT DEFAULT '[]',
+    reasoning TEXT,
+    routing_decision TEXT,
+    provider_used TEXT,
+    url_scan_status TEXT,
+    urls_total INTEGER DEFAULT 0,
+    urls_checked INTEGER DEFAULT 0,
+    is_quarantined INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW(),
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    FOREIGN KEY (label_id) REFERENCES custom_labels(label_id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_prefetched_emails_user_status 
+    ON prefetched_emails (user_id, analysis_status);
+
 -- TABLE 5: url_cache
 -- Security scan results for URLs extracted from emails
 CREATE TABLE IF NOT EXISTS url_cache (

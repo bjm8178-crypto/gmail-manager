@@ -786,9 +786,9 @@ async def emails_fetch_only(request: Request, user: dict = Depends(require_auth)
         return JSONResponse(content={"fetched": 0, "skipped": 0, "status": "already_fetching"})
 
     try:
-        from database import get_emails_by_status
+        from database import get_prefetched_emails
         if not prefetch:
-            existing_fetched = await asyncio.to_thread(get_emails_by_status, user_id, 'fetched', limit)
+            existing_fetched = await asyncio.to_thread(get_prefetched_emails, user_id, limit)
             if len(existing_fetched) > 0:
                 logger.info(
                     f"[FETCH-ONLY] User {user_id} has {len(existing_fetched)} staged/prefetched emails. "

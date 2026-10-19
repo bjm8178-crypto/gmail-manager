@@ -211,6 +211,37 @@ def init_db():
             )
         """)
 
+        # TABLE 4b: prefetched_emails (Dedicated staging buffer)
+        _execute(cursor, f"""
+            CREATE TABLE IF NOT EXISTS prefetched_emails (
+                email_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                sender TEXT,
+                subject TEXT,
+                snippet TEXT,
+                body TEXT,
+                received_at TEXT,
+                analysis_status TEXT DEFAULT 'pending',
+                label_id INTEGER DEFAULT NULL,
+                scam_score INTEGER,
+                scam_indicators TEXT DEFAULT '[]',
+                reasoning TEXT,
+                routing_decision TEXT,
+                provider_used TEXT,
+                url_scan_status TEXT,
+                urls_total INTEGER DEFAULT 0,
+                urls_checked INTEGER DEFAULT 0,
+                is_quarantined INTEGER DEFAULT 0,
+                created_at TIMESTAMP {timestamp_default},
+                FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+                FOREIGN KEY (label_id) REFERENCES custom_labels(label_id) ON DELETE SET NULL
+            )
+        """)
+        _execute(cursor, """
+            CREATE INDEX IF NOT EXISTS idx_prefetched_emails_user_status
+            ON prefetched_emails (user_id, analysis_status)
+        """)
+
         # TABLE 5: url_cache
         _execute(cursor, f"""
             CREATE TABLE IF NOT EXISTS url_cache (
@@ -349,6 +380,26 @@ def init_db():
         _execute(cursor, "CREATE INDEX IF NOT EXISTS idx_audit_user_time ON audit_log(user_id, timestamp DESC)")
         _execute(cursor, "CREATE INDEX IF NOT EXISTS idx_audit_action_time ON audit_log(action, timestamp DESC)")
         _execute(cursor, "CREATE INDEX IF NOT EXISTS idx_audit_severity_time ON audit_log(severity, timestamp DESC)")
+
+        # Clean migration: copy legacy 'fetched' rows into prefetched_emails, then remove from analyzed_emails
+        try:
+            _execute(cursor, """
+                INSERT INTO prefetched_emails (
+                    email_id, user_id, sender, subject, snippet, body, received_at,
+                    analysis_status, label_id, scam_score, scam_indicators, reasoning,
+                    routing_decision, provider_used, url_scan_status, urls_total, urls_checked, is_quarantined
+                )
+                SELECT 
+                    email_id, user_id, sender, subject, snippet, body, received_at,
+                    COALESCE(analysis_status, 'pending'), label_id, scam_score, scam_indicators, reasoning,
+                    routing_decision, provider_used, url_scan_status, urls_total, urls_checked, is_quarantined
+                FROM analyzed_emails
+                WHERE status = 'fetched'
+                ON CONFLICT (email_id) DO NOTHING
+            """)
+            _execute(cursor, "DELETE FROM analyzed_emails WHERE status = 'fetched'")
+        except Exception as mig_err:
+            logger.info(f"[DB] Migration note for prefetched_emails: {mig_err}")
 
         conn.commit()
         logger.info("[DB] Database initialized successfully")
@@ -830,11 +881,13 @@ def save_analyzed_email(email_id: str, user_id: int, label_id: int, scam_score: 
 
         logger.info(f"[DB] Saved email {email_id[:12]}... label_id={label_id}, scam_score={scam_score}, status={status}, source={source}")
         
-        # Phase 1 Task 3: Remove from retry queue AFTER success write, same transaction
-        if remove_from_retry and status == 'labeled':
-            _execute(cursor, "DELETE FROM retry_queue WHERE email_id = %s", (email_id,))
-            if cursor.rowcount > 0:
-                logger.info(f"[DB] Removed {email_id[:12]} from retry queue (same txn)")
+        # Clean up staging buffer and retry queue upon successful labeled save
+        if status == 'labeled':
+            _execute(cursor, "DELETE FROM prefetched_emails WHERE email_id = %s AND user_id = %s", (email_id, user_id))
+            if remove_from_retry:
+                _execute(cursor, "DELETE FROM retry_queue WHERE email_id = %s", (email_id,))
+                if cursor.rowcount > 0:
+                    logger.info(f"[DB] Removed {email_id[:12]} from retry queue (same txn)")
         
         conn.commit()
     except Exception:
@@ -876,12 +929,39 @@ def update_analyzed_email(email_id: str, label_id: int, scam_score: int,
                  (*values.values(), email_id, user_id, status))
         
         if cursor.rowcount == 0:
+            # Check if this email is in prefetched_emails waiting to be promoted
+            _execute(cursor, "SELECT sender, subject, snippet, body, received_at FROM prefetched_emails WHERE email_id = %s AND user_id = %s", (email_id, user_id))
+            p_row = cursor.fetchone()
+            if p_row:
+                p_dict = dict(p_row)
+                conn.commit()
+                _release_connection(conn)
+                return save_analyzed_email(
+                    email_id=email_id, user_id=user_id,
+                    snippet=p_dict.get("snippet", ""),
+                    sender=p_dict.get("sender", ""),
+                    subject=p_dict.get("subject", ""),
+                    body=p_dict.get("body", ""),
+                    received_at=p_dict.get("received_at"),
+                    remove_from_retry=remove_retry,
+                    label_id=label_id, scam_score=scam_score,
+                    scam_indicators=scam_indicators, is_quarantined=is_quarantined,
+                    status=status, source=source, ml_confidence=ml_confidence,
+                    provider_used=provider_used, reasoning=reasoning,
+                    routing_decision=routing_decision, v2_score=v2_score,
+                    analysis_status=analysis_status, category_status=category_status,
+                    url_scan_status=url_scan_status, urls_total=urls_total,
+                    urls_checked=urls_checked, user_decision=user_decision,
+                    attachment_risk=attachment_risk, attachment_details=attachment_details
+                )
             _execute(cursor, "SELECT 1 FROM analyzed_emails WHERE email_id = %s AND user_id = %s", (email_id, user_id))
             if cursor.fetchone():
                 logger.warning(f"[DB] Skipped downgrade: {email_id[:12]} already has status=labeled with valid score (attempted status={status})")
             else:
                 logger.warning(f"[DB] Email {email_id[:12]} not found for user {user_id} (update skipped)")
         else:
+            if status == 'labeled':
+                _execute(cursor, "DELETE FROM prefetched_emails WHERE email_id = %s AND user_id = %s", (email_id, user_id))
             logger.info(f"[DB] Updated email {email_id[:12]}... to status={status}, label_id={label_id}, score={scam_score}")
         
         # Phase 1 Task 3: Remove from retry queue AFTER success write, same transaction
@@ -987,7 +1067,56 @@ def update_analyzed_emails_bulk(user_id: int, rows: list[dict]) -> int:
         execute_values(cursor, sql, data)
         rowcount = cursor.rowcount
 
-        # Remove labeled rows from retry_queue in same transaction
+        # Also promote any rows that were staged in prefetched_emails into analyzed_emails
+        insert_from_prefetched_sql = """
+            INSERT INTO analyzed_emails (
+                email_id, user_id, sender, subject, snippet, body, received_at,
+                label_id, scam_score, scam_indicators, is_quarantined, status,
+                source, ml_confidence, provider_used, reasoning, routing_decision,
+                v2_score, analysis_status, category_status, url_scan_status,
+                urls_total, urls_checked, attachment_risk, attachment_details
+            )
+            SELECT 
+                p.email_id, p.user_id, p.sender, p.subject, p.snippet, p.body,
+                COALESCE(NULLIF(v.received_at, ''), p.received_at),
+                v.label_id, v.scam_score, v.scam_indicators, v.is_quarantined, v.status,
+                v.source, v.ml_confidence, v.provider_used, v.reasoning, v.routing_decision,
+                v.v2_score, v.analysis_status, v.category_status, v.url_scan_status,
+                v.urls_total, v.urls_checked, v.attachment_risk, v.attachment_details
+            FROM (VALUES %s) AS v(
+                email_id, label_id, scam_score, scam_indicators, is_quarantined,
+                status, source, ml_confidence, provider_used, reasoning,
+                routing_decision, v2_score, analysis_status, category_status,
+                url_scan_status, urls_total, urls_checked, received_at,
+                attachment_risk, attachment_details, uid
+            )
+            JOIN prefetched_emails p ON p.email_id = v.email_id AND p.user_id = v.uid
+            ON CONFLICT (email_id) DO UPDATE SET
+                label_id = EXCLUDED.label_id,
+                scam_score = EXCLUDED.scam_score,
+                scam_indicators = EXCLUDED.scam_indicators,
+                is_quarantined = EXCLUDED.is_quarantined,
+                status = EXCLUDED.status,
+                source = EXCLUDED.source,
+                provider_used = EXCLUDED.provider_used,
+                reasoning = EXCLUDED.reasoning,
+                routing_decision = EXCLUDED.routing_decision,
+                analysis_status = EXCLUDED.analysis_status,
+                url_scan_status = EXCLUDED.url_scan_status
+        """
+        try:
+            execute_values(cursor, insert_from_prefetched_sql, data)
+        except Exception as promo_err:
+            logger.debug(f"[DB] Bulk prefetched promotion note: {promo_err}")
+
+        # Clean up labeled rows from prefetched_emails and retry_queue in same transaction
+        labeled_ids = [
+            r["email_id"] for r in rows
+            if r.get("status") == "labeled"
+        ]
+        if labeled_ids:
+            _execute(cursor, "DELETE FROM prefetched_emails WHERE user_id = %s AND email_id = ANY(%s)", (user_id, labeled_ids))
+
         remove_ids = [
             r["email_id"] for r in rows
             if r.get("status") == "labeled" and r.get("remove_from_retry", True)
@@ -1033,18 +1162,125 @@ def update_email_label_id(email_id: str, label_id: int, *, user_id: int) -> None
         _release_connection(conn)
 
 
-def get_emails_by_status(user_id: int, status: str, limit: int = None) -> list[dict]:
+def get_prefetched_emails(user_id: int, limit: int = None) -> list[dict]:
     """
-    Return emails with a specific status, ordered by analyzed_at DESC (newest first).
-    Used by label_only_pipeline to fetch status='fetched' rows.
+    Return emails from prefetched_emails staging table.
+    Prioritizes pre-analyzed emails first!
     """
     conn = _get_connection()
     try:
         cursor = conn.cursor()
+        query = """SELECT * FROM prefetched_emails
+                   WHERE user_id = %s
+                   ORDER BY (CASE WHEN analysis_status = 'pre_analyzed' THEN 0 ELSE 1 END),
+                            COALESCE(NULLIF(received_at, ''), CAST(created_at AS TEXT)) DESC"""
+        params = [user_id]
+        if limit is not None:
+            query += " LIMIT %s"
+            params.append(limit)
+        _execute(cursor, query, tuple(params))
+        rows = [dict(row) for row in cursor.fetchall()]
+        for row in rows:
+            row["id"] = row["email_id"]
+            row["from"] = row["sender"] or ""
+            row["status"] = "fetched"
+            for key in ("snippet", "sender", "subject", "body"):
+                row[key] = row[key] or ""
+        return rows
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _release_connection(conn)
 
+
+def count_prefetched_emails(user_id: int) -> int:
+    """Return count of emails in prefetched_emails for user."""
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        _execute(cursor, "SELECT COUNT(*) as count FROM prefetched_emails WHERE user_id = %s", (user_id,))
+        row = cursor.fetchone()
+        return (row["count"] if isinstance(row, dict) else row[0]) if row else 0
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _release_connection(conn)
+
+
+def update_prefetched_email(email_id: str, user_id: int, **values):
+    """Update metadata for an email in prefetched_emails staging table."""
+    if not values:
+        return
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        clauses = []
+        params = []
+        for col, val in values.items():
+            clauses.append(f"{col} = %s")
+            params.append(val)
+        params.extend([email_id, user_id])
+        query = f"UPDATE prefetched_emails SET {', '.join(clauses)} WHERE email_id = %s AND user_id = %s"
+        _execute(cursor, query, tuple(params))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _release_connection(conn)
+
+
+def delete_prefetched_email(email_id: str, user_id: int):
+    """Delete an email from prefetched_emails staging table."""
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        _execute(cursor, "DELETE FROM prefetched_emails WHERE email_id = %s AND user_id = %s", (email_id, user_id))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _release_connection(conn)
+
+
+def save_prefetched_email(email_id: str, user_id: int, snippet: str = "", sender: str = "",
+                          subject: str = "", body: str = "", received_at: str = None,
+                          analysis_status: str = "pending", **kwargs):
+    """Insert single fetched email into prefetched_emails staging table."""
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        query = """
+            INSERT INTO prefetched_emails (email_id, user_id, sender, subject, snippet, body, received_at, analysis_status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (email_id) DO UPDATE SET
+                received_at = COALESCE(NULLIF(prefetched_emails.received_at, ''), EXCLUDED.received_at)
+        """
+        _execute(cursor, query, (email_id, user_id, sender, subject, snippet, body, received_at, analysis_status))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _release_connection(conn)
+
+
+def get_emails_by_status(user_id: int, status: str, limit: int = None) -> list[dict]:
+    """
+    Return emails with a specific status.
+    If status='fetched', redirects directly to prefetched_emails staging table.
+    """
+    if status == 'fetched':
+        return get_prefetched_emails(user_id=user_id, limit=limit)
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
         query = """SELECT * FROM analyzed_emails
                    WHERE user_id = %s AND status = %s
-                   ORDER BY (CASE WHEN analysis_status = 'pre_analyzed' THEN 0 ELSE 1 END), COALESCE(NULLIF(received_at, ''), CAST(analyzed_at AS TEXT)) DESC"""
+                   ORDER BY COALESCE(NULLIF(received_at, ''), CAST(analyzed_at AS TEXT)) DESC"""
         params = (user_id, status)
         if limit is not None:
             query += " LIMIT %s"
@@ -1066,16 +1302,16 @@ def get_emails_by_status(user_id: int, status: str, limit: int = None) -> list[d
 
 def get_unpreanalyzed_emails(user_id: int, limit: int = None) -> list[dict]:
     """
-    Return emails with status='fetched' that have NOT yet been pre-analyzed.
-    Ordered by received_at / analyzed_at DESC (newest first).
+    Return emails from prefetched_emails that have NOT yet been pre-analyzed.
+    Ordered by received_at / created_at DESC (newest first).
     """
     conn = _get_connection()
     try:
         cursor = conn.cursor()
-        query = """SELECT * FROM analyzed_emails
-                   WHERE user_id = %s AND status = 'fetched'
+        query = """SELECT * FROM prefetched_emails
+                   WHERE user_id = %s
                      AND (analysis_status IS NULL OR analysis_status != 'pre_analyzed')
-                   ORDER BY COALESCE(NULLIF(received_at, ''), CAST(analyzed_at AS TEXT)) DESC"""
+                   ORDER BY COALESCE(NULLIF(received_at, ''), CAST(created_at AS TEXT)) DESC"""
         params = (user_id,)
         if limit is not None:
             query += " LIMIT %s"
@@ -1085,6 +1321,7 @@ def get_unpreanalyzed_emails(user_id: int, limit: int = None) -> list[dict]:
         for row in rows:
             row["id"] = row["email_id"]
             row["from"] = row["sender"] or ""
+            row["status"] = "fetched"
             for key in ("snippet", "sender", "subject", "body"):
                 row[key] = row[key] or ""
         return rows
@@ -1174,12 +1411,8 @@ def get_analyzed_email_ids(user_id: int, email_ids: list[str]) -> set:
 
 
 def save_fetched_emails_bulk(user_id: int, rows: list[dict]):
-    """Bulk-insert fetched emails as status='fetched' placeholders.
-    Uses INSERT ... ON CONFLICT (email_id) DO NOTHING to never overwrite existing rows.
-    Step 2 perf/batching.
-
-    Args:
-        rows: list of dicts with keys: email_id, snippet, sender, subject, body
+    """Bulk-insert fetched emails into prefetched_emails staging table.
+    Uses INSERT ... ON CONFLICT (email_id) DO UPDATE SET received_at.
     """
     if not rows:
         return
@@ -1191,20 +1424,18 @@ def save_fetched_emails_bulk(user_id: int, rows: list[dict]):
         for chunk_start in range(0, len(rows), 100):
             chunk = rows[chunk_start:chunk_start + 100]
             values = [
-                (r['email_id'], user_id, None, None, '[]', 0,
-                 r.get('snippet', ''), r.get('sender', ''), r.get('subject', ''),
-                 'fetched', r.get('body', ''), r.get('received_at'))
+                (r['email_id'], user_id, r.get('sender', ''), r.get('subject', ''),
+                 r.get('snippet', ''), r.get('body', ''), r.get('received_at'), 'pending')
                 for r in chunk
             ]
             execute_values(cursor, """
-                INSERT INTO analyzed_emails
-                    (email_id, user_id, label_id, scam_score, scam_indicators,
-                     is_quarantined, snippet, sender, subject, status, body, received_at)
+                INSERT INTO prefetched_emails
+                    (email_id, user_id, sender, subject, snippet, body, received_at, analysis_status)
                 VALUES %s
                 ON CONFLICT (email_id) DO UPDATE SET
-                    received_at = COALESCE(NULLIF(analyzed_emails.received_at, ''), EXCLUDED.received_at)
+                    received_at = COALESCE(NULLIF(prefetched_emails.received_at, ''), EXCLUDED.received_at)
             """, values,
-            template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
+            template="(%s, %s, %s, %s, %s, %s, %s, %s)")
             conn.commit()
     except Exception:
         conn.rollback()
@@ -1682,6 +1913,7 @@ def reset_database(user_id: int) -> None:
             (user_id,),
         )
         _execute(cursor,"DELETE FROM analyzed_emails WHERE user_id = %s", (user_id,))
+        _execute(cursor,"DELETE FROM prefetched_emails WHERE user_id = %s", (user_id,))
         _execute(cursor,"DELETE FROM scan_cursor WHERE user_id = %s", (user_id,))
 
         conn.commit()
